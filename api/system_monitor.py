@@ -1,4 +1,4 @@
-"""Monitor de sistema - GPU, CPU, RAM, disco, Ollama."""
+"""Monitor de sistema - CPU, RAM, disco (GPU info opcional se disponivel)."""
 
 import subprocess
 import os

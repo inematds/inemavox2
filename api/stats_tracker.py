@@ -168,10 +168,6 @@ def _tts_default(engine: str, is_gpu: bool) -> float:
     """Estimativa TTS - a etapa mais variavel."""
     if engine == "edge":
         return 120  # online, depende da rede
-    elif engine == "bark":
-        return 60 if is_gpu else 600  # GPU vs CPU enorme diferenca
-    elif engine == "xtts":
-        return 120 if is_gpu else 900
     elif engine == "piper":
         return 30
     return 120

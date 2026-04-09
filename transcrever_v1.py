@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcrever v1 - Transcricao standalone usando faster-whisper ou parakeet."""
+"""Transcrever v1 - Transcricao standalone usando faster-whisper (CPU) ou Groq Whisper API."""
 
 import argparse
 import json
@@ -10,21 +10,23 @@ import tempfile
 import time
 from pathlib import Path
 
-CHATTERBOX_PYTHON = os.environ.get(
-    "CHATTERBOX_PYTHON",
-    "/home/nmaldaner/miniconda3/envs/chatterbox/bin/python3",
-)
 
-
-def write_checkpoint(workdir: Path, step_num: int, step_id: str, step_name: str):
-    """Escreve checkpoint no mesmo formato do dublar_pro_v5.py."""
+def write_checkpoint(workdir: Path, step_num: int, step_id: str, step_name: str, data: dict | None = None):
+    """Escreve checkpoint no mesmo formato do dublar_pro_v5.py, preservando dados anteriores."""
+    cp_path = workdir / "dub_work" / "checkpoint.json"
+    existing_data: dict = {}
+    if cp_path.exists():
+        try:
+            existing_data = json.loads(cp_path.read_text()).get("data", {}) or {}
+        except Exception:
+            pass
     cp = {
         "last_step_num": step_num,
         "last_step": step_id,
         "last_step_name": step_name,
         "timestamp": time.time(),
+        "data": {**existing_data, **(data or {})},
     }
-    cp_path = workdir / "dub_work" / "checkpoint.json"
     cp_path.parent.mkdir(parents=True, exist_ok=True)
     cp_path.write_text(json.dumps(cp, indent=2))
     print(f"[checkpoint] etapa {step_num}: {step_name}", flush=True)
@@ -92,127 +94,135 @@ def extract_audio(source: Path, workdir: Path) -> Path:
     return audio_path
 
 
-def _has_cuda() -> bool:
-    """Verifica se CUDA esta disponivel no PyTorch E no CTranslate2."""
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return False
-        import ctranslate2
-        ctranslate2.get_supported_compute_types("cuda")  # lanca ValueError se sem CUDA
-        return True
-    except Exception:
-        return False
+def transcribe_groq(audio_path: Path, model: str, src_lang: str | None) -> list[dict]:
+    """Transcreve via Groq Whisper API."""
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY nao configurada. Defina no .env ou variavel de ambiente.")
+
+    import urllib.request
+
+    print(f"[transcription] Transcrevendo com Groq Whisper API ({model})...", flush=True)
+
+    # Groq aceita arquivos ate 25MB. Se maior, precisamos dividir.
+    file_size_mb = audio_path.stat().st_size / (1024 * 1024)
+    if file_size_mb > 25:
+        print(f"[transcription] Arquivo grande ({file_size_mb:.1f}MB), dividindo em partes...", flush=True)
+        return _transcribe_groq_chunked(audio_path, model, src_lang, api_key)
+
+    return _groq_transcribe_file(audio_path, model, src_lang, api_key)
 
 
-def _chatterbox_has_cuda() -> bool:
-    """Verifica se o conda env chatterbox tem CUDA disponivel."""
-    if not Path(CHATTERBOX_PYTHON).exists():
-        return False
-    try:
-        result = subprocess.run(
-            [CHATTERBOX_PYTHON, "-c", "import torch; print('1' if torch.cuda.is_available() else '0')"],
-            capture_output=True, text=True, timeout=15,
-        )
-        return result.stdout.strip() == "1"
-    except Exception:
-        return False
+def _groq_transcribe_file(audio_path: Path, model: str, src_lang: str | None, api_key: str) -> list[dict]:
+    """Transcreve um arquivo via Groq API (max 25MB)."""
+    import urllib.request
+    import mimetypes
 
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
 
-def transcribe_whisper_gpu(audio_path: Path, model: str, src_lang: str | None) -> list[dict]:
-    """Transcreve via worker GPU usando openai-whisper no conda env chatterbox."""
-    worker_script = Path(__file__).parent / "whisper_gpu_worker.py"
-    output_json = audio_path.parent / "whisper_gpu_result.json"
+    # Multipart form data
+    boundary = f"----inemavox{int(time.time())}"
+    body_parts = []
 
-    cmd = [
-        CHATTERBOX_PYTHON, str(worker_script),
-        "--audio", str(audio_path),
-        "--model", model,
-        "--output-json", str(output_json),
-    ]
+    # Campo: file
+    content_type = mimetypes.guess_type(str(audio_path))[0] or "audio/wav"
+    body_parts.append(f"--{boundary}\r\n".encode())
+    body_parts.append(f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode())
+    body_parts.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+    body_parts.append(audio_path.read_bytes())
+    body_parts.append(b"\r\n")
+
+    # Campo: model
+    body_parts.append(f"--{boundary}\r\n".encode())
+    body_parts.append(b'Content-Disposition: form-data; name="model"\r\n\r\n')
+    body_parts.append(f"{model}\r\n".encode())
+
+    # Campo: response_format = verbose_json (para ter timestamps)
+    body_parts.append(f"--{boundary}\r\n".encode())
+    body_parts.append(b'Content-Disposition: form-data; name="response_format"\r\n\r\n')
+    body_parts.append(b"verbose_json\r\n")
+
+    # Campo: language (opcional)
     if src_lang:
-        cmd += ["--lang", src_lang]
+        body_parts.append(f"--{boundary}\r\n".encode())
+        body_parts.append(b'Content-Disposition: form-data; name="language"\r\n\r\n')
+        body_parts.append(f"{src_lang}\r\n".encode())
 
-    print(f"[transcription] Transcrevendo com Whisper GPU ({model})...", flush=True)
-    result = subprocess.run(cmd, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"whisper_gpu_worker retornou codigo {result.returncode}")
+    body_parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(body_parts)
 
-    data = json.loads(output_json.read_text(encoding="utf-8"))
-    segments = data["segments"]
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
 
-    for seg in segments:
-        print(f"  [{seg['start']:.1f}s -> {seg['end']:.1f}s] {seg['text']}", flush=True)
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
 
-    print(f"[transcription] {len(segments)} segmentos, idioma: {data.get('language', '?')}", flush=True)
+    segments = []
+    for seg in data.get("segments", []):
+        segments.append({
+            "start": round(seg["start"], 3),
+            "end": round(seg["end"], 3),
+            "text": seg["text"].strip(),
+        })
+        print(f"  [{seg['start']:.1f}s -> {seg['end']:.1f}s] {seg['text'].strip()}", flush=True)
+
+    lang = data.get("language", "?")
+    print(f"[transcription] {len(segments)} segmentos, idioma: {lang}", flush=True)
     return segments
 
 
-def _chatterbox_has_nemo() -> bool:
-    """Verifica se NeMo esta instalado no conda chatterbox."""
-    if not Path(CHATTERBOX_PYTHON).exists():
-        return False
-    try:
-        result = subprocess.run(
-            [CHATTERBOX_PYTHON, "-c", "import nemo.collections.asr; print('1')"],
-            capture_output=True, text=True, timeout=20,
-        )
-        return result.stdout.strip() == "1"
-    except Exception:
-        return False
+def _transcribe_groq_chunked(audio_path: Path, model: str, src_lang: str | None, api_key: str) -> list[dict]:
+    """Divide audio grande em partes de ~20min e transcreve cada uma via Groq."""
+    chunk_duration = 1200  # 20 minutos
+    # Obter duracao total
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", str(audio_path)],
+        capture_output=True, text=True, timeout=10,
+    )
+    total_duration = float(probe.stdout.strip())
+    all_segments = []
+    offset = 0.0
+    chunk_num = 0
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        while offset < total_duration:
+            chunk_num += 1
+            chunk_path = Path(tmpdir) / f"chunk_{chunk_num:03d}.wav"
+            cmd = [
+                "ffmpeg", "-y", "-i", str(audio_path),
+                "-ss", str(offset),
+                "-t", str(chunk_duration),
+                "-ac", "1", "-ar", "16000",
+                str(chunk_path),
+            ]
+            subprocess.run(cmd, capture_output=True, text=True)
+            print(f"[transcription] Processando parte {chunk_num} (offset {offset:.0f}s)...", flush=True)
+
+            segments = _groq_transcribe_file(chunk_path, model, src_lang, api_key)
+            # Ajustar timestamps com offset
+            for seg in segments:
+                seg["start"] = round(seg["start"] + offset, 3)
+                seg["end"] = round(seg["end"] + offset, 3)
+                all_segments.append(seg)
+
+            offset += chunk_duration
+
+    return all_segments
 
 
-def transcribe_parakeet_gpu(audio_path: Path, model: str, src_lang: str | None) -> list[dict]:
-    """Transcreve via parakeet_worker.py no conda chatterbox (GPU + NeMo)."""
-    worker_script = Path(__file__).parent / "parakeet_worker.py"
-    output_json = audio_path.parent / "parakeet_result.json"
-
-    cmd = [
-        CHATTERBOX_PYTHON, str(worker_script),
-        "--audio", str(audio_path),
-        "--model", model,
-        "--output-json", str(output_json),
-    ]
-
-    print(f"[transcription] Transcrevendo com Parakeet GPU ({model})...", flush=True)
-    result = subprocess.run(cmd, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"parakeet_worker retornou codigo {result.returncode}")
-
-    data = json.loads(output_json.read_text(encoding="utf-8"))
-    segments = data["segments"]
-
-    for seg in segments:
-        print(f"  [{seg['start']:.1f}s -> {seg['end']:.1f}s] {seg['text']}", flush=True)
-
-    print(f"[transcription] {len(segments)} segmentos, idioma: {data.get('language', 'en')}", flush=True)
-    return segments
-
-
-def transcribe_parakeet(audio_path: Path, model: str, src_lang: str | None) -> list[dict]:
-    """Transcreve com Parakeet. Usa GPU via conda env se NeMo disponivel, senao Whisper GPU."""
-    if _chatterbox_has_nemo():
-        try:
-            return transcribe_parakeet_gpu(audio_path, model, src_lang)
-        except Exception as e:
-            print(f"[transcription] Parakeet GPU falhou ({e}), usando Whisper GPU...", flush=True)
-    else:
-        print("[transcription] NeMo nao disponivel — usando Whisper GPU como fallback", flush=True)
-    return transcribe_whisper_gpu(audio_path, "large-v3", src_lang)
-
-
-def transcribe_whisper(audio_path: Path, model: str, src_lang: str | None) -> list[dict]:
-    """Transcreve com Whisper. Usa GPU via conda env se disponivel, senao faster-whisper CPU."""
-    if _chatterbox_has_cuda():
-        return transcribe_whisper_gpu(audio_path, model, src_lang)
-
+def transcribe_whisper_cpu(audio_path: Path, model: str, src_lang: str | None) -> list[dict]:
+    """Transcreve com faster-whisper em CPU."""
     print(f"[transcription] Transcrevendo com faster-whisper CPU {model}...", flush=True)
     from faster_whisper import WhisperModel
 
-    device = "cuda" if _has_cuda() else "cpu"
-    compute = "float16" if device == "cuda" else "int8"
-
-    wm = WhisperModel(model, device=device, compute_type=compute)
+    wm = WhisperModel(model, device="cpu", compute_type="int8")
     segments_iter, info = wm.transcribe(
         str(audio_path),
         language=src_lang or None,
@@ -233,6 +243,70 @@ def transcribe_whisper(audio_path: Path, model: str, src_lang: str | None) -> li
 
     print(f"[transcription] {len(results)} segmentos, idioma: {info.language}", flush=True)
     return results
+
+
+def transcribe_openai(audio_path: Path, model: str, src_lang: str | None) -> list[dict]:
+    """Transcreve via OpenAI Whisper API."""
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY nao configurada.")
+
+    import urllib.request
+
+    print(f"[transcription] Transcrevendo com OpenAI Whisper API ({model})...", flush=True)
+
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    boundary = f"----inemavox{int(time.time())}"
+    body_parts = []
+
+    content_type = "audio/wav"
+    body_parts.append(f"--{boundary}\r\n".encode())
+    body_parts.append(f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode())
+    body_parts.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+    body_parts.append(audio_path.read_bytes())
+    body_parts.append(b"\r\n")
+
+    body_parts.append(f"--{boundary}\r\n".encode())
+    body_parts.append(b'Content-Disposition: form-data; name="model"\r\n\r\n')
+    body_parts.append(f"{model}\r\n".encode())
+
+    body_parts.append(f"--{boundary}\r\n".encode())
+    body_parts.append(b'Content-Disposition: form-data; name="response_format"\r\n\r\n')
+    body_parts.append(b"verbose_json\r\n")
+
+    if src_lang:
+        body_parts.append(f"--{boundary}\r\n".encode())
+        body_parts.append(b'Content-Disposition: form-data; name="language"\r\n\r\n')
+        body_parts.append(f"{src_lang}\r\n".encode())
+
+    body_parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(body_parts)
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    segments = []
+    for seg in data.get("segments", []):
+        segments.append({
+            "start": round(seg["start"], 3),
+            "end": round(seg["end"], 3),
+            "text": seg["text"].strip(),
+        })
+        print(f"  [{seg['start']:.1f}s -> {seg['end']:.1f}s] {seg['text'].strip()}", flush=True)
+
+    lang = data.get("language", "?")
+    print(f"[transcription] {len(segments)} segmentos, idioma: {lang}", flush=True)
+    return segments
 
 
 def seconds_to_srt_time(s: float) -> str:
@@ -304,15 +378,36 @@ def export_transcription(segments: list[dict], outdir: Path):
     print(f"[export] Arquivos salvos em {outdir}", flush=True)
 
 
+# Engine default: usa GROQ_API_KEY se disponivel, senao whisper-cpu
+def _default_engine() -> str:
+    if os.environ.get("GROQ_API_KEY"):
+        return "groq"
+    return "whisper-cpu"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Transcrever v1")
     parser.add_argument("--in", dest="input", required=True, help="URL ou caminho do arquivo")
     parser.add_argument("--outdir", required=True, help="Diretorio de saida para transcricoes")
-    parser.add_argument("--asr", default="whisper", choices=["whisper", "parakeet"])
-    parser.add_argument("--whisper-model", default="large-v3", dest="whisper_model")
-    parser.add_argument("--parakeet-model", default="nvidia/parakeet-tdt-1.1b", dest="parakeet_model")
+    parser.add_argument("--engine", default=None, choices=["groq", "whisper-cpu", "openai"],
+                        help="Engine de STT (default: groq se GROQ_API_KEY disponivel, senao whisper-cpu)")
+    # Manter --asr para compatibilidade com jobs antigos (mapeia whisper -> whisper-cpu)
+    parser.add_argument("--asr", default=None, choices=["whisper", "parakeet"],
+                        help="(Legado) Use --engine em vez disso")
+    parser.add_argument("--whisper-model", default="small", dest="whisper_model",
+                        help="Modelo Whisper para CPU (tiny/small/medium) ou Groq (whisper-large-v3-turbo)")
+    parser.add_argument("--groq-model", default="whisper-large-v3-turbo", dest="groq_model",
+                        help="Modelo Groq Whisper (whisper-large-v3-turbo ou whisper-large-v3)")
     parser.add_argument("--src", default=None, help="Idioma de origem (auto-detect se vazio)")
     args = parser.parse_args()
+
+    # Resolver engine: --engine tem prioridade, senao --asr legado, senao auto-detect
+    if args.engine:
+        engine = args.engine
+    elif args.asr:
+        engine = "whisper-cpu"  # parakeet e whisper legado mapeiam para whisper-cpu
+    else:
+        engine = _default_engine()
 
     outdir = Path(args.outdir)
     workdir = outdir.parent  # dub_work fica no pai de transcription/
@@ -321,22 +416,33 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Checkpoint escrito APOS cada etapa (semantica: "etapa N concluida")
-        # Assim o progresso mostra a etapa N como done e N+1 como running
-
         # Etapa 1: Download
         source = download_input(args.input, workdir)
         write_checkpoint(workdir, 1, "download", "Download")
 
         # Etapa 2: Extraction
         audio = extract_audio(source, workdir)
-        write_checkpoint(workdir, 2, "extraction", "Extracao de audio")
+        _dur_s = 0
+        try:
+            _probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(audio)],
+                capture_output=True, text=True, timeout=10,
+            )
+            _dur_s = round(float(_probe.stdout.strip()), 1)
+        except Exception:
+            pass
+        _title = get_video_title(workdir, args.input)
+        write_checkpoint(workdir, 2, "extraction", "Extracao de audio",
+                         data={"video_duration_s": _dur_s, "video_title": _title})
 
         # Etapa 3: Transcription
-        if args.asr == "parakeet":
-            segments = transcribe_parakeet(audio, args.parakeet_model or "nvidia/parakeet-tdt-1.1b", args.src)
-        else:
-            segments = transcribe_whisper(audio, args.whisper_model, args.src)
+        if engine == "groq":
+            segments = transcribe_groq(audio, args.groq_model, args.src)
+        elif engine == "openai":
+            segments = transcribe_openai(audio, "whisper-1", args.src)
+        else:  # whisper-cpu
+            segments = transcribe_whisper_cpu(audio, args.whisper_model, args.src)
         write_checkpoint(workdir, 3, "transcription", "Transcricao")
 
         # Etapa 4: Export

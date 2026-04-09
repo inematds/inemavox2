@@ -18,7 +18,6 @@ from api.stats_tracker import STAGES, estimate_remaining, record_job_complete, f
 JOBS_DIR = Path(os.environ.get("JOBS_DIR", "jobs"))
 PIPELINE_SCRIPT = os.environ.get("PIPELINE_SCRIPT", "dublar_pro_v5.py")
 PYTHON_BIN = os.environ.get("PYTHON_BIN", sys.executable or shutil.which("python3") or "python3")
-DOCKER_GPU_IMAGE = os.environ.get("DOCKER_GPU_IMAGE", "inemavox:gpu")
 PROJECT_DIR = Path(__file__).parent.parent.resolve()
 
 # Stages para jobs de corte manual (3 etapas)
@@ -51,64 +50,12 @@ STAGES_DOWNLOAD = [
     {"num": 1, "id": "download", "name": "Baixando video", "icon": "⬇"},
 ]
 
-# Stages para jobs de TTS / Voice Clone (1 etapa)
+# Stages para jobs de TTS (1 etapa)
 STAGES_TTS = [
     {"num": 1, "id": "generating", "name": "Gerando audio", "icon": "🔊"},
 ]
 
-
-def _detect_docker_gpu() -> bool:
-    """Verifica se a imagem Docker GPU existe e Docker esta disponivel."""
-    try:
-        result = subprocess.run(
-            ["docker", "image", "inspect", DOCKER_GPU_IMAGE],
-            capture_output=True, text=True, timeout=5,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
-def _detect_device() -> str:
-    """Detecta se GPU CUDA esta disponivel (local ou Docker)."""
-    # Se temos Docker GPU, reportar como cuda
-    if DOCKER_GPU_AVAILABLE:
-        return "cuda"
-    # Tentar localmente
-    try:
-        result = subprocess.run(
-            [PYTHON_BIN, "-c", "import torch; print('cuda' if torch.cuda.is_available() else 'cpu')"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return result.stdout.strip() if result.returncode == 0 else "cpu"
-    except Exception:
-        return "cpu"
-
-
-def _detect_chatterbox_device() -> str:
-    """Detecta se o ambiente Chatterbox tem GPU CUDA disponivel."""
-    chatterbox_python = os.environ.get(
-        "CHATTERBOX_PYTHON",
-        "/home/nmaldaner/miniconda3/envs/chatterbox/bin/python3",
-    )
-    try:
-        result = subprocess.run(
-            [chatterbox_python, "-c", "import torch; print('cuda' if torch.cuda.is_available() else 'cpu')"],
-            capture_output=True, text=True, timeout=15,
-        )
-        return result.stdout.strip() if result.returncode == 0 else "cpu"
-    except Exception:
-        return "cpu"
-
-
-# Detectar capacidades ao iniciar
-DOCKER_GPU_AVAILABLE = _detect_docker_gpu()
-DEVICE = _detect_device()
-CHATTERBOX_DEVICE = _detect_chatterbox_device()
-
-# Log de inicializacao
-_mode = "Docker GPU" if DOCKER_GPU_AVAILABLE else f"Local ({DEVICE})"
-print(f"[JobManager] Modo: {_mode} | Device: {DEVICE} | Chatterbox: {CHATTERBOX_DEVICE} | Image: {DOCKER_GPU_IMAGE}")
+print(f"[JobManager] Modo: CPU | Python: {PYTHON_BIN}")
 
 
 class Job:
@@ -122,11 +69,11 @@ class Job:
         self.process: Optional[subprocess.Popen] = None
         self.workdir = JOBS_DIR / job_id
         self.error = None
-        self.device = DEVICE
+        self.device = "cpu"
         self.stage_times: dict[str, float] = {}
         self._last_stage_num = 0
         self._last_stage_start = 0.0
-        self._user_cancelled = False  # True apenas se o usuario clicou em Cancelar
+        self._user_cancelled = False
 
     @property
     def duration(self) -> float:
@@ -187,6 +134,28 @@ class Job:
         self._recover_if_output_exists()
         checkpoint = self._read_checkpoint()
         progress = self._calc_progress(checkpoint)
+
+        cp_data = checkpoint.get("data", {}) or {}
+        video_title = cp_data.get("video_title", "") or ""
+        video_duration_s = cp_data.get("video_duration_s", 0) or 0
+
+        if not video_title or not video_duration_s:
+            ts_path = self.workdir / "transcription" / "transcript_summary.json"
+            if ts_path.exists():
+                try:
+                    ts = json.loads(ts_path.read_text())
+                    if not video_title:
+                        video_title = ts.get("title", "") or ""
+                    if not video_duration_s:
+                        video_duration_s = ts.get("duration_s", 0) or 0
+                except Exception:
+                    pass
+
+        if not video_title:
+            cfg_input = self.config.get("input") or self.config.get("url") or ""
+            if cfg_input and not cfg_input.startswith("http"):
+                video_title = Path(cfg_input).stem
+
         return {
             "id": self.id,
             "status": self.status,
@@ -200,6 +169,8 @@ class Job:
             "checkpoint": checkpoint,
             "progress": progress,
             "stage_times": self.stage_times,
+            "video_title": video_title,
+            "video_duration_s": video_duration_s,
         }
 
     def _read_checkpoint(self) -> dict:
@@ -218,7 +189,6 @@ class Job:
         total = len(stages)
         percent = round((current_step / total) * 100) if total > 0 else 0
 
-        # Trackear tempo das etapas
         if current_step != self._last_stage_num and current_step > 0:
             now = time.time()
             start_time = self._last_stage_start if self._last_stage_start > 0 else (self.started_at or now)
@@ -238,7 +208,6 @@ class Job:
 
         current_stage_elapsed = round(time.time() - self._last_stage_start, 1) if self._last_stage_start > 0 else 0
 
-        # Montar info das stages
         stages_info = []
         for stage in stages:
             snum = stage["num"]
@@ -281,13 +250,11 @@ class Job:
         total = len(STAGES)
         percent = round((current_step / total) * 100) if total > 0 else 0
 
-        # Trackear tempo das etapas
         if current_step != self._last_stage_num and current_step > 0:
             now = time.time()
             start_time = self._last_stage_start if self._last_stage_start > 0 else (self.started_at or now)
             elapsed = round(now - start_time, 1)
 
-            # Quantas etapas completaram desde o ultimo check
             stages_completed = current_step - self._last_stage_num
             if stages_completed > 0:
                 per_stage = round(elapsed / stages_completed, 1)
@@ -300,24 +267,20 @@ class Job:
         elif self._last_stage_num == 0 and self.started_at:
             self._last_stage_start = self.started_at
 
-        # Calcular ETA
         eta = estimate_remaining(self.config, current_step, 0, self.device)
         eta_text = format_eta(eta["eta_seconds"]) if eta else "?"
 
-        # Tempo na etapa atual
         current_stage_elapsed = round(time.time() - self._last_stage_start, 1) if self._last_stage_start > 0 else 0
 
-        # Mapa de ferramenta por etapa baseado na config do job
         cfg = self.config
-        asr_label = cfg.get("asr_engine", "whisper")
-        if asr_label == "whisper":
-            asr_label = f"whisper {cfg.get('whisper_model', 'large-v3')}"
-        else:
-            pm = cfg.get("parakeet_model", "nvidia/parakeet-tdt-1.1b")
-            asr_label = f"parakeet {pm.split('/')[-1]}"
+        asr_engine = cfg.get("asr_engine", cfg.get("engine", "whisper-cpu"))
+        asr_label = asr_engine
+        if asr_engine in ("whisper", "whisper-cpu"):
+            asr_label = f"whisper {cfg.get('whisper_model', 'small')}"
+        elif asr_engine == "groq":
+            asr_label = f"groq {cfg.get('groq_model', 'whisper-large-v3-turbo')}"
+
         trad_label = cfg.get("translation_engine", "m2m100")
-        if trad_label == "ollama" and cfg.get("ollama_model"):
-            trad_label = f"ollama ({cfg['ollama_model']})"
         stage_tools = {
             "download": "yt-dlp",
             "extraction": "ffmpeg",
@@ -331,7 +294,6 @@ class Job:
             "mux": "ffmpeg",
         }
 
-        # Montar info das stages
         stages_info = []
         for stage in STAGES:
             snum = stage["num"]
@@ -341,7 +303,6 @@ class Job:
                 st = {**stage, "status": "done", "time": self.stage_times.get(sid), "tool": tool}
             elif snum == current_step + 1:
                 st = {**stage, "status": "running", "elapsed": current_stage_elapsed, "tool": tool}
-                # Adicionar progresso detalhado do log (ex: yt-dlp %)
                 log_progress = self._parse_log_progress()
                 if log_progress:
                     st["log_progress"] = log_progress
@@ -371,13 +332,11 @@ class Job:
         if not log_path.exists():
             return None
         try:
-            # Ler ultimos 4KB do log (suficiente para a linha mais recente)
             with open(log_path, "rb") as f:
                 f.seek(0, 2)
                 size = f.tell()
                 f.seek(max(0, size - 4096))
                 tail = f.read().decode("utf-8", errors="replace")
-            # yt-dlp: "[download]  52.3% of  371.95MiB at    5.38MiB/s ETA 00:32"
             match = re.search(
                 r"\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+\S+)\s+at\s+([\d.]+\S+)\s+ETA\s+(\S+)",
                 tail,
@@ -390,7 +349,6 @@ class Job:
                     "speed": match.group(3),
                     "eta": match.group(4),
                 }
-            # ffmpeg merge: "[Merger] Merging formats into ..."
             if "[Merger]" in tail or "Merging formats" in tail:
                 return {"type": "download", "percent": 99, "detail": "Mesclando audio+video..."}
         except Exception:
@@ -432,13 +390,10 @@ class JobManager:
             if not config_path.exists():
                 continue
             job_id = job_dir.name
-            # Re-avaliar jobs que estavam em estado terminal mas podem ter
-            # concluido durante um reload (Docker container continuou rodando)
             existing = self.jobs.get(job_id)
             if existing and existing.status in ("completed", "running", "queued"):
                 continue
             if existing and existing.status in ("failed", "cancelled"):
-                # Re-checar se os arquivos de saida existem agora
                 existing_config = existing.config
                 existing_type = existing_config.get("job_type", "dubbing")
                 if existing_type == "cutting":
@@ -467,33 +422,17 @@ class JobManager:
                 job = Job(job_id, config)
                 job_type = config.get("job_type", "dubbing")
 
-                # Aplicar device correto para jobs de Chatterbox
-                if config.get("engine") in ("chatterbox", "chatterbox-vc") or (
-                    job_type == "dubbing" and config.get("tts_engine") == "chatterbox"
-                ):
-                    job.device = CHATTERBOX_DEVICE
-
-                # Transcricao usa Whisper GPU via conda env quando CUDA disponivel
-                if job_type == "transcription" and CHATTERBOX_DEVICE == "cuda":
-                    job.device = CHATTERBOX_DEVICE
-
-                # Restaurar created_at real (mtime do config.json = momento da criacao)
                 job.created_at = config_path.stat().st_mtime
-                # Restaurar stage_times se existir
                 times_path = job_dir / "stage_times.json"
                 if times_path.exists():
                     try:
                         job.stage_times = json.loads(times_path.read_text())
                     except Exception:
                         pass
-                # Determinar status pelo que existe no disco
                 checkpoint = job._read_checkpoint()
-                # Sincronizar _last_stage_num com checkpoint para evitar
-                # que _calc_progress recalcule e sobrescreva stage_times
                 if checkpoint.get("last_step_num"):
                     job._last_stage_num = checkpoint["last_step_num"]
 
-                # Restaurar started_at e finished_at a partir dos arquivos
                 log_path = job_dir / "output.log"
                 if log_path.exists():
                     log_stat = log_path.stat()
@@ -503,7 +442,6 @@ class JobManager:
                         job.started_at = job.created_at
                         job.finished_at = job.created_at + total_dur
 
-                # Detectar conclusao por tipo de job
                 if job_type == "cutting":
                     clips_dir = job_dir / "clips"
                     has_output = clips_dir.exists() and any(clips_dir.glob("clip_*.mp4"))
@@ -556,16 +494,6 @@ class JobManager:
         job = Job(job_id, config)
         job_type = config.get("job_type", "dubbing")
 
-        # Jobs de Chatterbox rodam no env conda com CUDA
-        if config.get("engine") in ("chatterbox", "chatterbox-vc") or (
-            job_type == "dubbing" and config.get("tts_engine") == "chatterbox"
-        ):
-            job.device = CHATTERBOX_DEVICE
-
-        # Transcricao usa Whisper GPU via conda env quando CUDA disponivel
-        if job_type == "transcription" and CHATTERBOX_DEVICE == "cuda":
-            job.device = CHATTERBOX_DEVICE
-
         job.workdir.mkdir(parents=True, exist_ok=True)
         (job.workdir / "dub_work").mkdir(exist_ok=True)
 
@@ -595,48 +523,32 @@ class JobManager:
 
         job_type = job.config.get("job_type", "dubbing")
 
-        if DOCKER_GPU_AVAILABLE:
-            if job_type == "cutting":
-                cmd = self._build_docker_cut_command(job)
-            elif job_type == "transcription":
-                cmd = self._build_docker_transcribe_command(job)
-            elif job_type == "download":
-                cmd = self._build_docker_download_command(job)
-            elif job_type in ("tts_generate", "voice_clone"):
-                cmd = self._build_local_tts_command(job)
-            else:
-                cmd = self._build_docker_command(job)
+        if job_type == "cutting":
+            cmd = self._build_cut_command(job)
+        elif job_type == "transcription":
+            cmd = self._build_transcribe_command(job)
+        elif job_type == "download":
+            cmd = self._build_download_command(job)
+        elif job_type in ("tts_generate", "voice_clone"):
+            cmd = self._build_tts_command(job)
         else:
-            if job_type == "cutting":
-                cmd = self._build_local_cut_command(job)
-            elif job_type == "transcription":
-                cmd = self._build_local_transcribe_command(job)
-            elif job_type == "download":
-                cmd = self._build_local_download_command(job)
-            elif job_type in ("tts_generate", "voice_clone"):
-                cmd = self._build_local_tts_command(job)
-            else:
-                cmd = self._build_local_command(job)
+            cmd = self._build_dub_command(job)
 
         log_path = job.workdir / "output.log"
 
         try:
             env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"  # evita perda de log quando OOM killer mata o processo
-            if not DOCKER_GPU_AVAILABLE:
-                python_dir = os.path.dirname(PYTHON_BIN)
-                if python_dir not in env.get("PATH", ""):
-                    env["PATH"] = python_dir + ":" + env.get("PATH", "")
+            env["PYTHONUNBUFFERED"] = "1"
+            python_dir = os.path.dirname(PYTHON_BIN)
+            if python_dir not in env.get("PATH", ""):
+                env["PATH"] = python_dir + ":" + env.get("PATH", "")
 
             with open(log_path, "w") as log_file:
-                # Docker roda do project dir, local roda do workdir
-                cwd = str(PROJECT_DIR) if DOCKER_GPU_AVAILABLE else str(job.workdir)
-
                 job.process = subprocess.Popen(
                     cmd,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
-                    cwd=cwd,
+                    cwd=str(job.workdir),
                     env=env,
                 )
 
@@ -650,17 +562,14 @@ class JobManager:
                 exit_code = job.process.returncode
                 job.finished_at = time.time()
 
-                # Processar todas as transicoes de etapa pendentes
                 checkpoint = job._read_checkpoint()
                 job._calc_progress(checkpoint)
 
-                # Registrar tempo da ultima etapa
                 stages = job._get_stages()
                 if job._last_stage_num > 0 and job._last_stage_num <= len(stages):
                     last_sid = stages[job._last_stage_num - 1]["id"]
                     job.stage_times[last_sid] = round(job.finished_at - job._last_stage_start, 1)
 
-                # Persistir stage_times em disco (sobrevive a restarts)
                 try:
                     times_path = job.workdir / "stage_times.json"
                     times_path.write_text(json.dumps(job.stage_times, indent=2))
@@ -669,14 +578,11 @@ class JobManager:
 
                 if exit_code == 0:
                     job.status = "completed"
-                    # Salvar estatisticas para aprendizado (apenas dubbing)
                     if job_type == "dubbing":
                         record_job_complete(job.config, job.stage_times, job.duration, job.device)
                 elif job._user_cancelled or exit_code == -signal.SIGTERM:
-                    # Cancelado pelo usuario (via botao Cancelar ou SIGTERM explicito)
                     job.status = "cancelled"
                 else:
-                    # SIGKILL sem cancelamento do usuario = OOM killer ou crash externo → falhou
                     job.status = "failed"
                     error_msg = f"Exit code: {exit_code}"
                     if exit_code == -signal.SIGKILL:
@@ -698,87 +604,8 @@ class JobManager:
 
         await self._notify(job.id, {"event": "finished", "job": job.to_dict()})
 
-    def _build_docker_cut_command(self, job: Job) -> list:
-        """Monta comando Docker para corte de clips."""
-        config = job.config
-        workdir_abs = str(job.workdir.resolve())
-        script_path = str(PROJECT_DIR / "clipar_v1.py")
-        hf_cache = str(Path.home() / ".cache" / "huggingface")
-        whisper_cache = str(Path.home() / ".cache" / "whisper")
-
-        Path(hf_cache).mkdir(parents=True, exist_ok=True)
-        Path(whisper_cache).mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            "docker", "run", "--rm",
-            "--gpus", "all",
-            "--ipc=host",
-            "--name", f"inemavox-{job.id}",
-            "--ulimit", "memlock=-1",
-            "--ulimit", "stack=67108864",
-            "--network", "host",
-            # Script montado como volume read-only
-            "-v", f"{script_path}:/app/clipar_v1.py:ro",
-            # Dirs de trabalho
-            "-v", f"{workdir_abs}/dub_work:/app/dub_work",
-            "-v", f"{workdir_abs}/clips:/app/clips",
-            # Cache de modelos
-            "-v", f"{hf_cache}:/root/.cache/huggingface",
-            "-v", f"{whisper_cache}:/root/.cache/whisper",
-            # Sobrescrever entrypoint para rodar nosso script
-            "--entrypoint", "python",
-            DOCKER_GPU_IMAGE,
-            "/app/clipar_v1.py",
-        ]
-
-        input_val = config["input"]
-        if not input_val.startswith("http") and os.path.exists(input_val):
-            input_abs = str(Path(input_val).resolve())
-            cmd.insert(-3, "-v")
-            cmd.insert(-3, f"{input_abs}:/app/input_video{Path(input_val).suffix}")
-            input_val = f"/app/input_video{Path(input_val).suffix}"
-
-        cmd.extend(["--in", input_val])
-        cmd.extend(["--outdir", "/app/clips"])
-        cmd.extend(["--mode", config.get("mode", "manual")])
-
-        if config.get("mode") == "manual" and config.get("timestamps"):
-            cmd.extend(["--timestamps", config["timestamps"]])
-        elif config.get("mode") in ("viral", "topics"):
-            if config.get("num_clips"):
-                cmd.extend(["--num-clips", str(config["num_clips"])])
-            if config.get("split_equal"):
-                cmd.append("--split-equal")
-            else:
-                if config.get("ollama_model"):
-                    cmd.extend(["--ollama-model", config["ollama_model"]])
-                if config.get("min_duration"):
-                    cmd.extend(["--min-duration", str(config["min_duration"])])
-                if config.get("max_duration"):
-                    cmd.extend(["--max-duration", str(config["max_duration"])])
-                if config.get("asr_engine") and config["asr_engine"] != "whisper":
-                    cmd.extend(["--asr-engine", config["asr_engine"]])
-                if config.get("whisper_model"):
-                    cmd.extend(["--whisper-model", config["whisper_model"]])
-                if config.get("parakeet_model"):
-                    cmd.extend(["--parakeet-model", config["parakeet_model"]])
-                if config.get("llm_provider") and config["llm_provider"] != "ollama":
-                    cmd.extend(["--llm-provider", config["llm_provider"]])
-                if config.get("llm_model"):
-                    cmd.extend(["--llm-model", config["llm_model"]])
-                if config.get("llm_api_key"):
-                    cmd.extend(["--llm-api-key", config["llm_api_key"]])
-                if config.get("llm_base_url"):
-                    cmd.extend(["--llm-base-url", config["llm_base_url"]])
-                if config.get("system_prompt"):
-                    cmd.extend(["--system-prompt", config["system_prompt"]])
-                if config.get("user_prompt"):
-                    cmd.extend(["--user-prompt", config["user_prompt"]])
-
-        return cmd
-
-    def _build_local_cut_command(self, job: Job) -> list:
-        """Monta comando local para corte de clips."""
+    def _build_cut_command(self, job: Job) -> list:
+        """Monta comando para corte de clips."""
         config = job.config
         script_path = str(PROJECT_DIR / "clipar_v1.py")
         cmd = [PYTHON_BIN, script_path]
@@ -795,20 +622,15 @@ class JobManager:
             if config.get("split_equal"):
                 cmd.append("--split-equal")
             else:
-                if config.get("ollama_model"):
-                    cmd.extend(["--ollama-model", config["ollama_model"]])
                 if config.get("min_duration"):
                     cmd.extend(["--min-duration", str(config["min_duration"])])
                 if config.get("max_duration"):
                     cmd.extend(["--max-duration", str(config["max_duration"])])
-                if config.get("asr_engine") and config["asr_engine"] != "whisper":
-                    cmd.extend(["--asr-engine", config["asr_engine"]])
                 if config.get("whisper_model"):
                     cmd.extend(["--whisper-model", config["whisper_model"]])
-                if config.get("parakeet_model"):
-                    cmd.extend(["--parakeet-model", config["parakeet_model"]])
-                if config.get("llm_provider") and config["llm_provider"] != "ollama":
-                    cmd.extend(["--llm-provider", config["llm_provider"]])
+                # LLM provider
+                provider = config.get("llm_provider", "groq")
+                cmd.extend(["--llm-provider", provider])
                 if config.get("llm_model"):
                     cmd.extend(["--llm-model", config["llm_model"]])
                 if config.get("llm_api_key"):
@@ -822,56 +644,8 @@ class JobManager:
 
         return cmd
 
-    def _build_docker_transcribe_command(self, job: Job) -> list:
-        """Monta comando Docker para transcricao."""
-        config = job.config
-        workdir_abs = str(job.workdir.resolve())
-        script_path = str(PROJECT_DIR / "transcrever_v1.py")
-        hf_cache = str(Path.home() / ".cache" / "huggingface")
-        whisper_cache = str(Path.home() / ".cache" / "whisper")
-
-        Path(hf_cache).mkdir(parents=True, exist_ok=True)
-        Path(whisper_cache).mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            "docker", "run", "--rm",
-            "--gpus", "all",
-            "--ipc=host",
-            "--name", f"inemavox-{job.id}",
-            "--ulimit", "memlock=-1",
-            "--ulimit", "stack=67108864",
-            "--network", "host",
-            "-v", f"{script_path}:/app/transcrever_v1.py:ro",
-            "-v", f"{workdir_abs}/dub_work:/app/dub_work",
-            "-v", f"{workdir_abs}/transcription:/app/transcription",
-            "-v", f"{hf_cache}:/root/.cache/huggingface",
-            "-v", f"{whisper_cache}:/root/.cache/whisper",
-            "--entrypoint", "python",
-            DOCKER_GPU_IMAGE,
-            "/app/transcrever_v1.py",
-        ]
-
-        input_val = config["input"]
-        if not input_val.startswith("http") and os.path.exists(input_val):
-            input_abs = str(Path(input_val).resolve())
-            cmd.insert(-3, "-v")
-            cmd.insert(-3, f"{input_abs}:/app/input_video{Path(input_val).suffix}")
-            input_val = f"/app/input_video{Path(input_val).suffix}"
-
-        cmd.extend(["--in", input_val])
-        cmd.extend(["--outdir", "/app/transcription"])
-
-        asr = config.get("asr_engine", "whisper")
-        cmd.extend(["--asr", asr])
-        if config.get("whisper_model"):
-            cmd.extend(["--whisper-model", config["whisper_model"]])
-        if config.get("src_lang"):
-            cmd.extend(["--src", config["src_lang"]])
-
-        return cmd
-
-    def _build_local_transcribe_command(self, job: Job) -> list:
-        """Monta comando local para transcricao."""
+    def _build_transcribe_command(self, job: Job) -> list:
+        """Monta comando para transcricao."""
         config = job.config
         script_path = str(PROJECT_DIR / "transcrever_v1.py")
         cmd = [PYTHON_BIN, script_path]
@@ -879,53 +653,24 @@ class JobManager:
         cmd.extend(["--in", config["input"]])
         cmd.extend(["--outdir", str(job.workdir.resolve() / "transcription")])
 
-        asr = config.get("asr_engine", "whisper")
-        cmd.extend(["--asr", asr])
+        # Engine de STT configuravel
+        engine = config.get("stt_engine") or config.get("asr_engine", "whisper-cpu")
+        # Mapear engines legadas
+        if engine in ("whisper", "parakeet"):
+            engine = "whisper-cpu"
+        cmd.extend(["--engine", engine])
+
         if config.get("whisper_model"):
             cmd.extend(["--whisper-model", config["whisper_model"]])
+        if config.get("groq_model"):
+            cmd.extend(["--groq-model", config["groq_model"]])
         if config.get("src_lang"):
             cmd.extend(["--src", config["src_lang"]])
 
         return cmd
 
-    def _build_docker_download_command(self, job: Job) -> list:
-        """Monta comando Docker para download de video."""
-        config = job.config
-        workdir_abs = str(job.workdir.resolve())
-        script_path = str(PROJECT_DIR / "baixar_v1.py")
-
-        cmd = [
-            "docker", "run", "--rm",
-            "--gpus", "all",
-            "--ipc=host",
-            "--name", f"inemavox-{job.id}",
-            "--ulimit", "memlock=-1",
-            "--ulimit", "stack=67108864",
-            "--network", "host",
-            "-v", f"{script_path}:/app/baixar_v1.py:ro",
-            "-v", f"{workdir_abs}/dub_work:/app/dub_work",
-            "-v", f"{workdir_abs}/download:/app/download",
-            "--entrypoint", "python",
-            DOCKER_GPU_IMAGE,
-            "/app/baixar_v1.py",
-            "--outdir", "/app/download",
-        ]
-
-        if config.get("local_file"):
-            local_abs = str(Path(config["local_file"]).resolve())
-            cmd.insert(-3, "-v")
-            cmd.insert(-3, f"{local_abs}:/app/local_input{Path(config['local_file']).suffix}")
-            cmd.extend(["--local-file", f"/app/local_input{Path(config['local_file']).suffix}"])
-        else:
-            cmd.extend(["--url", config["url"]])
-
-        if config.get("quality"):
-            cmd.extend(["--quality", config["quality"]])
-
-        return cmd
-
-    def _build_local_download_command(self, job: Job) -> list:
-        """Monta comando local para download de video ou processamento de arquivo local."""
+    def _build_download_command(self, job: Job) -> list:
+        """Monta comando para download de video."""
         config = job.config
         script_path = str(PROJECT_DIR / "baixar_v1.py")
 
@@ -944,8 +689,8 @@ class JobManager:
 
         return cmd
 
-    def _build_local_tts_command(self, job: Job) -> list:
-        """Monta comando local para geracao de audio (TTS / Voice Clone)."""
+    def _build_tts_command(self, job: Job) -> list:
+        """Monta comando para geracao de audio (TTS)."""
         config = job.config
         script_path = str(PROJECT_DIR / "tts_direct.py")
         outdir = str(job.workdir.resolve() / "audio_out")
@@ -959,117 +704,11 @@ class JobManager:
         ]
         if config.get("voice"):
             cmd.extend(["--voice", config["voice"]])
-        if config.get("ref_audio") and Path(config["ref_audio"]).exists():
-            cmd.extend(["--ref", config["ref_audio"]])
-        if config.get("cfg_weight") is not None:
-            cmd.extend(["--cfg-weight", str(config["cfg_weight"])])
-        if config.get("exaggeration") is not None:
-            cmd.extend(["--exaggeration", str(config["exaggeration"])])
-        if config.get("temperature") is not None:
-            cmd.extend(["--temperature", str(config["temperature"])])
 
         return cmd
 
-    def _build_docker_command(self, job: Job) -> list:
-        """Monta comando para rodar pipeline dentro do Docker com GPU."""
-        config = job.config
-        workdir_abs = str(job.workdir.resolve())
-        hf_cache = str(Path.home() / ".cache" / "huggingface")
-        whisper_cache = str(Path.home() / ".cache" / "whisper")
-
-        # Garantir que os dirs de cache existam no host
-        Path(hf_cache).mkdir(parents=True, exist_ok=True)
-        Path(whisper_cache).mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            "docker", "run", "--rm",
-            "--gpus", "all",
-            "--ipc=host",
-            "--name", f"inemavox-{job.id}",
-            "--ulimit", "memlock=-1",
-            "--ulimit", "stack=67108864",
-            # Network host para acessar Ollama no localhost:11434
-            "--network", "host",
-            # Montar workdir do job (checkpoint, logs, output)
-            "-v", f"{workdir_abs}/dub_work:/app/dub_work",
-            "-v", f"{workdir_abs}/dublado:/app/dublado",
-            # Cache de modelos HuggingFace (evitar re-download)
-            "-v", f"{hf_cache}:/root/.cache/huggingface",
-            # Cache OpenAI Whisper (evitar re-download do modelo ~3GB)
-            "-v", f"{whisper_cache}:/root/.cache/whisper",
-            # Imagem
-            DOCKER_GPU_IMAGE,
-        ]
-
-        # Argumentos do pipeline (passados ao ENTRYPOINT)
-        input_val = config["input"]
-
-        # Se input e um arquivo local, montar no container
-        if not input_val.startswith("http") and os.path.exists(input_val):
-            input_abs = str(Path(input_val).resolve())
-            cmd.insert(-1, "-v")
-            cmd.insert(-1, f"{input_abs}:/app/input_video{Path(input_val).suffix}")
-            input_val = f"/app/input_video{Path(input_val).suffix}"
-
-        cmd.extend(["--in", input_val])
-
-        if config.get("src_lang"):
-            cmd.extend(["--src", config["src_lang"]])
-        cmd.extend(["--tgt", config.get("tgt_lang", "pt")])
-
-        cmd.extend(["--outdir", "/app/dublado"])
-
-        asr = config.get("asr_engine", "whisper")
-        cmd.extend(["--asr", asr])
-        if config.get("whisper_model"):
-            cmd.extend(["--whisper-model", config["whisper_model"]])
-        if asr == "parakeet" and config.get("parakeet_model"):
-            cmd.extend(["--parakeet-model", config["parakeet_model"]])
-
-        tradutor = config.get("translation_engine", "m2m100")
-        cmd.extend(["--tradutor", tradutor])
-        if tradutor == "ollama" and config.get("ollama_model"):
-            cmd.extend(["--modelo", config["ollama_model"]])
-        if config.get("large_model"):
-            cmd.append("--large-model")
-
-        tts = config.get("tts_engine", "edge")
-        cmd.extend(["--tts", tts])
-        if config.get("voice"):
-            cmd.extend(["--voice", config["voice"]])
-        if config.get("tts_rate"):
-            cmd.extend(["--rate", config["tts_rate"]])
-
-        if config.get("sync_mode"):
-            cmd.extend(["--sync", config["sync_mode"]])
-        if config.get("maxstretch"):
-            cmd.extend(["--maxstretch", str(config["maxstretch"])])
-        if config.get("tolerance"):
-            cmd.extend(["--tolerance", str(config["tolerance"])])
-        if config.get("no_truncate"):
-            cmd.append("--no-truncate")
-        if config.get("use_rubberband") is False:
-            cmd.append("--no-rubberband")
-
-        if config.get("diarize"):
-            cmd.append("--diarize")
-            if config.get("num_speakers"):
-                cmd.extend(["--num-speakers", str(config["num_speakers"])])
-            if config.get("diarize_engine"):
-                cmd.extend(["--diarize-engine", config["diarize_engine"]])
-
-        if config.get("clone_voice"):
-            cmd.append("--clonar-voz")
-
-        if config.get("maxdur"):
-            cmd.extend(["--maxdur", str(config["maxdur"])])
-        if config.get("seed"):
-            cmd.extend(["--seed", str(config["seed"])])
-
-        return cmd
-
-    def _build_local_command(self, job: Job) -> list:
-        """Monta comando para rodar pipeline localmente (CPU)."""
+    def _build_dub_command(self, job: Job) -> list:
+        """Monta comando para pipeline de dublagem."""
         config = job.config
         cmd = [PYTHON_BIN, os.path.abspath(PIPELINE_SCRIPT)]
 
@@ -1081,17 +720,14 @@ class JobManager:
 
         cmd.extend(["--outdir", str(job.workdir.resolve() / "dublado")])
 
+        # ASR engine - mapear para novo formato
         asr = config.get("asr_engine", "whisper")
         cmd.extend(["--asr", asr])
         if config.get("whisper_model"):
             cmd.extend(["--whisper-model", config["whisper_model"]])
-        if asr == "parakeet" and config.get("parakeet_model"):
-            cmd.extend(["--parakeet-model", config["parakeet_model"]])
 
         tradutor = config.get("translation_engine", "m2m100")
         cmd.extend(["--tradutor", tradutor])
-        if tradutor == "ollama" and config.get("ollama_model"):
-            cmd.extend(["--modelo", config["ollama_model"]])
         if config.get("large_model"):
             cmd.append("--large-model")
 
@@ -1120,13 +756,15 @@ class JobManager:
             if config.get("diarize_engine"):
                 cmd.extend(["--diarize-engine", config["diarize_engine"]])
 
-        if config.get("clone_voice"):
-            cmd.append("--clonar-voz")
-
         if config.get("maxdur"):
             cmd.extend(["--maxdur", str(config["maxdur"])])
         if config.get("seed"):
             cmd.extend(["--seed", str(config["seed"])])
+
+        if config.get("content_type") == "curso":
+            cmd.extend(["--segment-max-words", "30", "--segment-pause", "0.5"])
+        if config.get("content_type") == "curso" or config.get("summary"):
+            cmd.append("--summary")
 
         return cmd
 
@@ -1135,7 +773,7 @@ class JobManager:
         if not job:
             return False
         if job.process and job.process.poll() is None:
-            job._user_cancelled = True  # sinaliza que foi o usuario quem cancelou
+            job._user_cancelled = True
             job.process.terminate()
             try:
                 job.process.wait(timeout=10)
@@ -1152,19 +790,15 @@ class JobManager:
         job = self.jobs.get(job_id)
         if not job:
             return False
-        # Cancelar processo se ativo
         if job.status == "running" and job.process and job.process.poll() is None:
             job.process.terminate()
             try:
                 job.process.wait(timeout=5)
             except Exception:
                 job.process.kill()
-        # Remover da fila se queued
         job.status = "deleted"
-        # Deletar arquivos do disco
         if job.workdir.exists():
             shutil.rmtree(job.workdir, ignore_errors=True)
-        # Remover da memória
         self.jobs.pop(job_id, None)
         return True
 

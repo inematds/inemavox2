@@ -1,10 +1,8 @@
 # dublar_pro_v5.py
-# Pipeline de dublagem PROFISSIONAL v5.0 - COMPLETO
-# Todas as 4 fases implementadas:
-# - Fase 1: Correcoes criticas (normalizacao, max_length, maxstretch, seed)
-# - Fase 2: Qualidade (contexto, CPS adaptativo, Ollama)
-# - Fase 3: Features (YouTube, XTTS clonagem, diarizacao)
-# - Fase 4: Testes e documentacao
+# Pipeline de dublagem PROFISSIONAL v5.0 - CPU-only
+# GPU dependencies removed. TTS: Edge (online) + Piper (offline).
+# Transcription: Faster-Whisper (CPU, CTranslate2 int8).
+# Translation: M2M100 (CPU) with optional Ollama fallback.
 
 import os, sys, json, csv, argparse, subprocess, shutil, re, warnings
 from pathlib import Path
@@ -281,14 +279,6 @@ def warmup_ollama(model):
             return False
     except Exception as e:
         print(f"[WARN] Warmup falhou: {e}")
-        return False
-
-def check_xtts():
-    """Verifica se XTTS (Coqui TTS) esta disponivel"""
-    try:
-        from TTS.api import TTS
-        return True
-    except:
         return False
 
 def _patch_torchaudio_compat():
@@ -1066,98 +1056,7 @@ def merge_transcription_with_diarization(transcription_segs, diarization_segs):
     return merged
 
 # ============================================================================
-# ETAPA 3: TRANSCRICAO — WORKERS GPU (subprocess no conda chatterbox)
-# ============================================================================
-
-_CHATTERBOX_PYTHON = os.environ.get(
-    "CHATTERBOX_PYTHON",
-    "/home/nmaldaner/miniconda3/envs/chatterbox/bin/python3",
-)
-
-
-def _chatterbox_has_cuda():
-    """Verifica se o conda env chatterbox tem CUDA disponivel."""
-    import subprocess as _sp
-    if not os.path.exists(_CHATTERBOX_PYTHON):
-        return False
-    try:
-        r = _sp.run(
-            [_CHATTERBOX_PYTHON, "-c", "import torch; print('1' if torch.cuda.is_available() else '0')"],
-            capture_output=True, text=True, timeout=15,
-        )
-        return r.stdout.strip() == "1"
-    except Exception:
-        return False
-
-
-def _chatterbox_has_nemo():
-    """Verifica se NeMo esta instalado no conda chatterbox."""
-    import subprocess as _sp
-    if not os.path.exists(_CHATTERBOX_PYTHON):
-        return False
-    try:
-        r = _sp.run(
-            [_CHATTERBOX_PYTHON, "-c", "import nemo.collections.asr; print('1')"],
-            capture_output=True, text=True, timeout=20,
-        )
-        return r.stdout.strip() == "1"
-    except Exception:
-        return False
-
-
-def _transcribe_whisper_gpu_worker(wav_path, workdir, src_lang, model_size):
-    """Transcreve via whisper_gpu_worker.py no conda chatterbox (GPU)."""
-    import subprocess as _sp
-    worker = os.path.join(os.path.dirname(__file__), "whisper_gpu_worker.py")
-    output_json = os.path.join(workdir, "whisper_gpu_result.json")
-
-    cmd = [
-        _CHATTERBOX_PYTHON, worker,
-        "--audio", str(wav_path),
-        "--model", model_size,
-        "--output-json", output_json,
-    ]
-    if src_lang:
-        cmd += ["--lang", src_lang]
-
-    print(f"[whisper_gpu] Transcrevendo com Whisper GPU ({model_size})...", flush=True)
-    result = _sp.run(cmd, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"whisper_gpu_worker falhou (codigo {result.returncode})")
-
-    import json as _json
-    data = _json.loads(open(output_json, encoding="utf-8").read())
-    return data["segments"], data.get("language", src_lang or "?")
-
-
-def _transcribe_parakeet_gpu_worker(wav_path, workdir, src_lang, model_name,
-                                    segment_pause=0.3, segment_max_words=15):
-    """Transcreve via parakeet_worker.py no conda chatterbox (GPU + NeMo)."""
-    import subprocess as _sp
-    worker = os.path.join(os.path.dirname(__file__), "parakeet_worker.py")
-    output_json = os.path.join(workdir, "parakeet_result.json")
-
-    cmd = [
-        _CHATTERBOX_PYTHON, worker,
-        "--audio", str(wav_path),
-        "--model", model_name,
-        "--output-json", output_json,
-        "--segment-pause", str(segment_pause),
-        "--segment-max-words", str(segment_max_words),
-    ]
-
-    print(f"[parakeet_gpu] Transcrevendo com Parakeet GPU ({model_name})...", flush=True)
-    result = _sp.run(cmd, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"parakeet_worker falhou (codigo {result.returncode})")
-
-    import json as _json
-    data = _json.loads(open(output_json, encoding="utf-8").read())
-    return data["segments"], data.get("language", "en")
-
-
-# ============================================================================
-# ETAPA 3: TRANSCRICAO (WHISPER)
+# ETAPA 3: TRANSCRICAO (WHISPER) — CPU only
 # ============================================================================
 
 def transcribe_faster_whisper(wav_path, workdir, src_lang, model_size="medium", diarize=False, num_speakers=None, diarize_engine="pyannote"):
@@ -1170,37 +1069,13 @@ def transcribe_faster_whisper(wav_path, workdir, src_lang, model_size="medium", 
     print("=== ETAPA 3: Transcricao (Whisper) ===")
     print("="*60)
 
-    # Tentar GPU via worker chatterbox primeiro
-    if _chatterbox_has_cuda():
-        try:
-            raw_segs, detected_lang = _transcribe_whisper_gpu_worker(wav_path, workdir, src_lang, model_size)
-            return _finish_whisper_transcription(raw_segs, detected_lang, src_lang, workdir,
-                                                 diarize, num_speakers, diarize_engine)
-        except Exception as e:
-            print(f"[WARN] Whisper GPU falhou ({e}), usando CPU como fallback...", flush=True)
-
     from faster_whisper import WhisperModel
-    import torch
 
-    # Detectar melhor device: CUDA se CTranslate2 suporta, senao CPU
     device = "cpu"
     compute_type = "int8"
-    if torch.cuda.is_available():
-        try:
-            import ctranslate2
-            cuda_types = ctranslate2.get_supported_compute_types("cuda")
-            if cuda_types:
-                device = "cuda"
-                compute_type = "float16" if "float16" in cuda_types else "int8_float16" if "int8_float16" in cuda_types else "int8"
-        except (ValueError, Exception):
-            pass
 
     print(f"[INFO] Whisper modelo: {model_size}")
-    print(f"[INFO] Whisper device: {device.upper()}" + (" (GPU acelerado)" if device == "cuda" else " (CTranslate2)"))
-    if torch.cuda.is_available():
-        print(f"[INFO] GPU disponivel: {torch.cuda.get_device_name(0)}")
-        if device == "cpu":
-            print(f"[WARN] CTranslate2 sem suporte CUDA nesta plataforma - Whisper rodara em CPU")
+    print(f"[INFO] Whisper device: CPU (CTranslate2 int8)")
     if src_lang:
         print(f"[INFO] Idioma origem: {src_lang}")
     else:
@@ -1301,163 +1176,6 @@ def _finish_whisper_transcription(segs, detected_lang, src_lang, workdir,
 # ============================================================================
 # ETAPA 3B: TRANSCRICAO (OpenAI Whisper via PyTorch) - FALLBACK GPU
 # ============================================================================
-
-def transcribe_openai_whisper(wav_path, workdir, src_lang, model_size="medium", diarize=False, num_speakers=None, diarize_engine="pyannote"):
-    """Transcricao com OpenAI Whisper original (PyTorch, suporta CUDA nativo).
-
-    Usado como fallback quando CTranslate2 nao tem suporte CUDA (ex: ARM64/aarch64).
-    Retorna: (json_path, srt_path, segments, detected_language)
-    """
-    print("\n" + "="*60)
-    print("=== ETAPA 3: Transcricao (OpenAI Whisper - PyTorch GPU) ===")
-    print("="*60)
-
-    import torch
-    # Fix: NVIDIA PyTorch 2.6.0a0 e rejeitado pelo torch.load por ser "alpha < 2.6 final"
-    if "2.6.0a0" in torch.__version__:
-        torch.__version__ = "2.6.0"
-    import whisper
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[INFO] Whisper modelo: {model_size}")
-    print(f"[INFO] Whisper device: {device.upper()} (PyTorch nativo)")
-    if torch.cuda.is_available():
-        print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
-    if src_lang:
-        print(f"[INFO] Idioma origem: {src_lang}")
-    else:
-        print(f"[INFO] Idioma origem: AUTO-DETECTAR")
-
-    model = whisper.load_model(model_size, device=device)
-
-    print("[INFO] Transcrevendo com GPU... (isso deve ser rapido)")
-    result = model.transcribe(
-        str(wav_path),
-        language=src_lang or None,
-        beam_size=5,
-        best_of=1,
-        temperature=0.0,
-        condition_on_previous_text=False,   # evita loop de alucinacao entre chunks
-        fp16=(device == "cuda"),
-        no_repeat_ngram_size=5,             # penaliza n-grams repetidos
-    )
-
-    detected_lang = result.get("language", src_lang)
-    if not src_lang:
-        print(f"[INFO] Idioma detectado: {detected_lang}")
-
-    # Converter segmentos para formato padrao
-    segs = []
-    for s in result.get("segments", []):
-        text = (s.get("text") or "").strip()
-        if text:
-            segs.append({
-                "start": float(s["start"]),
-                "end": float(s["end"]),
-                "text": text,
-            })
-
-    # Merge de segmentos incompletos
-    segs_antes = len(segs)
-    segs = merge_incomplete_segments(segs, max_duration=15.0)
-    segs_depois = len(segs)
-    if segs_antes != segs_depois:
-        print(f"[INFO] Merge de frases incompletas: {segs_antes} -> {segs_depois} segmentos")
-
-    # Diarizacao opcional
-    if diarize:
-        # Liberar modelo Whisper da RAM antes de carregar pyannote (evita OOM)
-        try:
-            del model
-        except Exception:
-            pass
-        _liberar_memoria()
-        print("[INFO] Modelo Whisper liberado da RAM antes da diarizacao")
-        if diarize_engine == "nemo":
-            print("[INFO] Usando diarizacao NeMo (titanet_large)")
-            diar_segs = diarize_audio_nemo(wav_path, workdir, num_speakers)
-        else:
-            diar_segs = diarize_audio(wav_path, workdir, num_speakers)
-        if diar_segs:
-            segs = merge_transcription_with_diarization(segs, diar_segs)
-
-    # Salvar arquivos
-    srt_path = Path(workdir, "asr.srt")
-    json_path = Path(workdir, "asr.json")
-
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for i, s in enumerate(segs, 1):
-            speaker_tag = f"[{s.get('speaker', 'SPEAKER_00')}] " if 'speaker' in s else ""
-            f.write(f"{i}\n{ts_stamp(s['start'])} --> {ts_stamp(s['end'])}\n{speaker_tag}{s['text']}\n\n")
-
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "language": detected_lang,
-            "language_specified": src_lang,
-            "segments": segs,
-            "info": {
-                "duration": None,
-            }
-        }, f, ensure_ascii=False, indent=2)
-
-    # Liberar memoria GPU
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    print(f"[OK] Transcrito: {len(segs)} segmentos (GPU PyTorch)")
-    return json_path, srt_path, segs, detected_lang
-
-
-# ============================================================================
-# ETAPA 3C: TRANSCRICAO (NVIDIA PARAKEET) - ALTERNATIVA
-# ============================================================================
-
-def transcribe_parakeet(wav_path, workdir, src_lang=None, model_name="nvidia/parakeet-tdt-1.1b",
-                        segment_pause=0.3, segment_max_words=15,
-                        diarize=False, num_speakers=None, diarize_engine="pyannote"):
-    """Transcricao com NVIDIA Parakeet (NeMo)
-
-    Mais rapido que Whisper, otimizado para GPUs NVIDIA.
-
-    Args:
-        wav_path: Caminho do arquivo WAV
-        workdir: Diretorio de trabalho
-        src_lang: Idioma origem (Parakeet so suporta ingles por enquanto)
-        model_name: Modelo Parakeet (tdt-1.1b, ctc-1.1b, rnnt-1.1b)
-        segment_pause: Pausa minima (segundos) para criar novo segmento
-        segment_max_words: Maximo de palavras por segmento
-
-    Returns: (json_path, srt_path, segments, detected_language)
-    """
-    print("\n" + "="*60)
-    print("=== ETAPA 3: Transcricao (NVIDIA Parakeet) ===")
-    print("="*60)
-
-    # Tentar worker GPU (conda chatterbox com NeMo)
-    if _chatterbox_has_nemo():
-        try:
-            raw_segs, detected_lang = _transcribe_parakeet_gpu_worker(
-                wav_path, workdir, src_lang, model_name, segment_pause, segment_max_words
-            )
-            # Parakeet nao gera pontuacao — merge por duracao para formar frases maiores
-            segs_antes = len(raw_segs)
-            raw_segs = merge_incomplete_segments(raw_segs, max_duration=20.0)
-            if segs_antes != len(raw_segs):
-                print(f"[INFO] Merge Parakeet: {segs_antes} → {len(raw_segs)} segmentos")
-            return _finish_whisper_transcription(raw_segs, detected_lang, src_lang, workdir,
-                                                 diarize, num_speakers, diarize_engine,
-                                                 wav_path=wav_path)
-        except Exception as e:
-            print(f"[WARN] Parakeet GPU worker falhou ({e}), tentando Whisper GPU...", flush=True)
-    else:
-        print("[WARN] NeMo nao disponivel no conda chatterbox — usando Whisper GPU como fallback...")
-
-    return transcribe_faster_whisper(wav_path, workdir, src_lang,
-                                     model_size="large-v3",
-                                     diarize=diarize, num_speakers=num_speakers,
-                                     diarize_engine=diarize_engine)
-
 
 # ============================================================================
 # ETAPA 4: TRADUCAO - FUNCOES AUXILIARES
@@ -2241,227 +1959,6 @@ def split_long_segments(segments, maxdur):
     print(f"[OK] Resultado: {len(out)} segmentos ({split_count} divididos)")
     return out
 
-# ============================================================================
-# FASE 3: CLONAGEM DE VOZ (XTTS)
-# ============================================================================
-
-def extract_voice_sample(wav_path, workdir, duration=10):
-    """Extrai amostra de voz do audio original para clonagem
-
-    Args:
-        wav_path: caminho do audio original
-        workdir: diretorio de trabalho
-        duration: duracao da amostra em segundos
-
-    Returns:
-        caminho da amostra de voz
-    """
-    print("[INFO] Extraindo amostra de voz para clonagem...")
-
-    sample_path = Path(workdir, "voice_sample.wav")
-
-    # Extrair os primeiros 'duration' segundos com fala
-    # Pular os primeiros 2 segundos (possiveis ruidos)
-    sh([
-        "ffmpeg", "-y",
-        "-ss", "2",
-        "-i", str(wav_path),
-        "-t", str(duration),
-        "-ar", "22050",
-        "-ac", "1",
-        "-c:a", "pcm_s16le",
-        str(sample_path)
-    ])
-
-    print(f"[OK] Amostra extraida: {sample_path}")
-    return sample_path
-
-def tts_xtts_clone(segments, workdir, tgt_lang, voice_sample):
-    """TTS com XTTS - Clona voz do audio original
-
-    FASE 3: Clonagem de voz usando XTTS v2
-    """
-    print("\n" + "="*60)
-    print("=== ETAPA 6: TTS (XTTS - Clonagem de Voz) ===")
-    print("="*60)
-
-    if not check_xtts():
-        print("[ERRO] XTTS nao disponivel. Instale com: pip install TTS")
-        print("[INFO] Nota: Requer Python < 3.12")
-        return None, None, None
-
-    try:
-        from TTS.api import TTS
-        from scipy.io import wavfile
-        import torch
-
-        device = get_device()
-
-        # Carregar modelo XTTS
-        print("[INFO] Carregando modelo XTTS v2...")
-        tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
-
-        # Mapear idioma
-        lang_map = {
-            "pt": "pt", "pt-br": "pt", "pt_br": "pt",
-            "en": "en", "en-us": "en", "en-gb": "en",
-            "es": "es", "fr": "fr", "de": "de",
-            "it": "it", "ja": "ja", "zh-cn": "zh-cn",
-        }
-        lang = lang_map.get(tgt_lang.lower(), "en")
-
-        SAMPLE_RATE = 22050
-        seg_files = []
-        metricas = []
-
-        print(f"[INFO] Voz de referencia: {voice_sample}")
-        print(f"[INFO] Idioma: {lang}")
-
-        tsv = Path(workdir, "segments.csv")
-        with open(tsv, "w", encoding="utf-8", newline="") as fcsv:
-            writer = csv.writer(fcsv)
-            writer.writerow(["idx", "t_in", "t_out", "target_dur", "actual_dur", "ratio", "texto_trad", "file"])
-
-            for i, s in enumerate(segments, 1):
-                txt = (s.get("text_trad") or "").strip()
-                target_dur = s["end"] - s["start"]
-
-                if len(re.findall(r"[A-Za-z0-9]", txt)) < 3:
-                    txt = "pausa"
-
-                out_path = Path(workdir, f"seg_{i:04d}.wav")
-
-                try:
-                    # Gerar com voz clonada
-                    tts.tts_to_file(
-                        text=txt,
-                        file_path=str(out_path),
-                        speaker_wav=str(voice_sample),
-                        language=lang
-                    )
-
-                    actual_dur = ffprobe_duration(out_path)
-                    ratio = actual_dur / target_dur if target_dur > 0 else 1.0
-
-                except Exception as e:
-                    print(f"  [ERRO] Seg {i}: {e}")
-                    silence = np.zeros(int(target_dur * SAMPLE_RATE), dtype=np.int16)
-                    wavfile.write(str(out_path), SAMPLE_RATE, silence)
-                    actual_dur = target_dur
-                    ratio = 1.0
-
-                seg_files.append(out_path)
-                metricas.append({"idx": i, "target": target_dur, "actual": actual_dur, "ratio": ratio})
-
-                writer.writerow([i, s["start"], s["end"], f"{target_dur:.3f}",
-                               f"{actual_dur:.3f}", f"{ratio:.3f}", txt[:50], out_path.name])
-
-                if i % 5 == 0 or i == len(segments):
-                    print(f"  Progresso: {i}/{len(segments)}")
-
-        if metricas:
-            ratios = [m["ratio"] for m in metricas]
-            print(f"\n[STATS] TTS XTTS:")
-            print(f"  Segmentos: {len(seg_files)}")
-            print(f"  Ratio medio: {np.mean(ratios):.2%}")
-
-        return seg_files, SAMPLE_RATE, metricas
-
-    except Exception as e:
-        print(f"[ERRO] XTTS falhou: {e}")
-        return None, None, None
-
-# ============================================================================
-# ETAPA 6: TTS (CHATTERBOX - Voice Clone Neural)
-# ============================================================================
-
-def tts_chatterbox(segments, workdir, tgt_lang, voice_sample=None):
-    """TTS com Chatterbox — voice clone zero-shot via subprocess.
-
-    Roteamento automatico:
-      - tgt_lang == 'en'  -> Turbo 350M (rapido)
-      - tgt_lang != 'en'  -> Multilingual 500M (PT, ES, FR, DE...)
-
-    Requer conda env 'chatterbox' ou variavel CHATTERBOX_PYTHON.
-    """
-    print("\n" + "="*60)
-    print("=== ETAPA 6: TTS (Chatterbox - Voice Clone Neural) ===")
-    print("="*60)
-
-    import tempfile
-
-    chatterbox_python = os.environ.get(
-        "CHATTERBOX_PYTHON",
-        "/home/nmaldaner/miniconda3/envs/chatterbox/bin/python3"
-    )
-    worker_script = Path(__file__).parent / "chatterbox_tts_worker.py"
-
-    if not Path(chatterbox_python).exists():
-        print(f"[ERRO] Python Chatterbox nao encontrado: {chatterbox_python}")
-        print("[DICA] Defina CHATTERBOX_PYTHON=/path/python3 do conda env chatterbox")
-        return None, None, None
-
-    if not worker_script.exists():
-        print(f"[ERRO] Worker nao encontrado: {worker_script}")
-        return None, None, None
-
-    CHATTERBOX_SR = 24000
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
-                                     delete=False, encoding="utf-8") as f:
-        json.dump(segments, f, ensure_ascii=False)
-        segs_json_path = f.name
-
-    output_json_path = Path(workdir) / "chatterbox_result.json"
-
-    try:
-        cmd = [
-            chatterbox_python, str(worker_script),
-            "--segments-json", segs_json_path,
-            "--workdir", str(workdir),
-            "--lang", tgt_lang,
-            "--output-json", str(output_json_path),
-        ]
-        if voice_sample and Path(voice_sample).exists():
-            cmd += ["--ref", str(voice_sample)]
-            print(f"[INFO] Voice clone ativo: {voice_sample}")
-        else:
-            print("[INFO] Sem referencia de voz — usando voz padrao")
-
-        print(f"[INFO] Iniciando Chatterbox worker (lang={tgt_lang})...")
-        result = subprocess.run(cmd, text=True, timeout=3600)
-
-        if result.returncode != 0:
-            print(f"[ERRO] Chatterbox worker retornou codigo {result.returncode}")
-            return None, None, None
-
-        with open(output_json_path, encoding="utf-8") as f:
-            data = json.load(f)
-
-        seg_files = [Path(s["file"]) for s in data["segments"]]
-        sr = data["sr"]
-        metricas = [
-            {"idx": s["idx"], "target": s["target"],
-             "actual": s["actual"], "ratio": s["ratio"]}
-            for s in data["segments"]
-        ]
-
-        ratios = [m["ratio"] for m in metricas]
-        print(f"\n[STATS] TTS Chatterbox:")
-        print(f"  Segmentos : {len(seg_files)}")
-        print(f"  SR        : {sr} Hz")
-        print(f"  Ratio med : {np.mean(ratios):.2%}")
-
-        return seg_files, sr, metricas
-
-    except subprocess.TimeoutExpired:
-        print("[ERRO] Chatterbox worker timeout (>60min)")
-        return None, None, None
-    except Exception as e:
-        print(f"[ERRO] tts_chatterbox falhou: {e}")
-        return None, None, None
-    finally:
-        Path(segs_json_path).unlink(missing_ok=True)
 
 # ============================================================================
 # ETAPA 6: TTS (EDGE - PADRAO v4)
@@ -2607,140 +2104,6 @@ def tts_edge(segments, workdir, tgt_lang, voice=None, rate="+0%", speaker_voices
         print(f"  Segmentos: {len(seg_files)}")
         print(f"  Ratio medio: {np.mean(ratios):.2%}")
         print(f"  Ratio min/max: {np.min(ratios):.2%} / {np.max(ratios):.2%}")
-
-    return seg_files, SAMPLE_RATE, metricas
-
-# ============================================================================
-# ETAPA 6: TTS (BARK COM SEED FIXA)
-# ============================================================================
-
-def tts_bark_optimized(segments, workdir, text_temp=0.7, wave_temp=0.5,
-                       history_prompt=None, max_retries=2):
-    """TTS com Bark otimizado - v4: seed fixa para consistencia"""
-    print("\n" + "="*60)
-    print("=== ETAPA 6: TTS (Bark Otimizado) ===")
-    print("="*60)
-
-    import torch
-    from scipy.io.wavfile import write
-
-    set_global_seed(GLOBAL_SEED)
-    print(f"[INFO] Seed fixa: {GLOBAL_SEED}")
-
-    _original_torch_load = torch.load
-
-    def _patched_torch_load(f, map_location=None, *args, **kwargs):
-        kwargs['weights_only'] = False
-        return _original_torch_load(f, map_location=map_location, *args, **kwargs)
-
-    torch.load = _patched_torch_load
-
-    from bark import generate_audio, SAMPLE_RATE
-
-    device = get_device()
-    print(f"[INFO] Bark device: {device.upper()}")
-
-    if device == "cuda":
-        os.environ['SUNO_USE_SMALL_MODELS'] = '0'
-        os.environ['SUNO_OFFLOAD_CPU'] = '0'
-
-    history = None
-    if history_prompt:
-        try:
-            from bark.generation import load_history_prompt
-            history = load_history_prompt(history_prompt)
-            print(f"[INFO] Usando voz: {history_prompt}")
-        except Exception as e:
-            print(f"[WARN] Nao foi possivel carregar voz {history_prompt}: {e}")
-            history = history_prompt
-
-    seg_files = []
-    metricas = []
-
-    tsv = Path(workdir, "segments.csv")
-    with open(tsv, "w", encoding="utf-8", newline="") as fcsv:
-        writer = csv.writer(fcsv)
-        writer.writerow(["idx", "t_in", "t_out", "target_dur", "actual_dur",
-                        "ratio", "retries", "texto_trad", "file"])
-
-        for i, s in enumerate(segments, 1):
-            set_global_seed(GLOBAL_SEED + i)
-
-            txt = (s.get("text_trad") or "").strip()
-            target_dur = s["end"] - s["start"]
-
-            if len(re.findall(r"[A-Za-z0-9]", txt)) < 3:
-                txt = "pausa curta"
-
-            out_path = Path(workdir, f"seg_{i:04d}.wav")
-
-            best_audio = None
-            best_dur = float('inf')
-            best_ratio = float('inf')
-            retries_used = 0
-
-            for attempt in range(max_retries + 1):
-                current_text_temp = max(0.4, text_temp - attempt * 0.1)
-                current_wave_temp = max(0.3, wave_temp - attempt * 0.1)
-
-                try:
-                    audio = generate_audio(
-                        txt,
-                        history_prompt=history,
-                        text_temp=current_text_temp,
-                        waveform_temp=current_wave_temp
-                    )
-
-                    actual_dur = len(audio) / SAMPLE_RATE
-                    ratio = actual_dur / target_dur if target_dur > 0 else 1.0
-
-                    if ratio <= 1.3:
-                        best_audio = audio
-                        best_dur = actual_dur
-                        best_ratio = ratio
-                        break
-
-                    if abs(ratio - 1.0) < abs(best_ratio - 1.0):
-                        best_audio = audio
-                        best_dur = actual_dur
-                        best_ratio = ratio
-
-                    retries_used = attempt + 1
-
-                except Exception as e:
-                    print(f"  [ERRO] Seg {i} tentativa {attempt+1}: {e}")
-                    if attempt == max_retries:
-                        best_audio = np.zeros(int(target_dur * SAMPLE_RATE), dtype=np.float32)
-                        best_dur = target_dur
-                        best_ratio = 1.0
-
-            if best_audio is not None:
-                audio_int16 = normalize_audio_safe(best_audio)
-                write(out_path, SAMPLE_RATE, audio_int16)
-            else:
-                audio_int16 = np.zeros(int(target_dur * SAMPLE_RATE), dtype=np.int16)
-                write(out_path, SAMPLE_RATE, audio_int16)
-
-            seg_files.append(out_path)
-            metricas.append({
-                "idx": i, "target": target_dur, "actual": best_dur,
-                "ratio": best_ratio, "retries": retries_used
-            })
-
-            writer.writerow([i, s["start"], s["end"], f"{target_dur:.3f}",
-                           f"{best_dur:.3f}", f"{best_ratio:.3f}", retries_used,
-                           txt[:50], out_path.name])
-
-            if i % 10 == 0 or i == len(segments):
-                print(f"  Progresso: {i}/{len(segments)}")
-
-    torch.load = _original_torch_load
-
-    if metricas:
-        ratios = [m["ratio"] for m in metricas]
-        print(f"\n[STATS] TTS Bark:")
-        print(f"  Segmentos: {len(seg_files)}")
-        print(f"  Ratio medio: {np.mean(ratios):.2%}")
 
     return seg_files, SAMPLE_RATE, metricas
 
@@ -3338,15 +2701,11 @@ def generate_summary_audio(segs_trad, workdir, tgt_lang, tts_engine, args):
     seg_resumo = [{"start": 0.0, "end": 999.0, "text_trad": texto_resumo, "text": texto_resumo}]
 
     try:
-        if tts_engine == "edge":
+        if tts_engine == "piper":
+            seg_files_r, sr_r, _ = tts_piper(seg_resumo, workdir, tgt_lang)
+        else:
             voice = getattr(args, "voice", None)
             seg_files_r, sr_r, _ = tts_edge(seg_resumo, workdir, tgt_lang, voice=voice)
-        elif tts_engine == "piper":
-            seg_files_r, sr_r, _ = tts_piper(seg_resumo, workdir, tgt_lang)
-        elif tts_engine == "chatterbox":
-            seg_files_r, sr_r, _ = tts_chatterbox(seg_resumo, workdir, tgt_lang, args)
-        else:
-            seg_files_r, sr_r, _ = tts_edge(seg_resumo, workdir, tgt_lang)
 
         if seg_files_r and seg_files_r[0].exists():
             # Renomear para summary_audio.wav
@@ -3530,23 +2889,14 @@ Exemplos:
   # YouTube direto
   python dublar_pro_v5.py --in "https://youtube.com/watch?v=XXX" --tgt pt
 
-  # Com Ollama (traducao natural)
-  python dublar_pro_v5.py --in video.mp4 --tgt pt --tradutor ollama --modelo llama3
-
-  # Clonagem de voz
-  python dublar_pro_v5.py --in video.mp4 --src en --tgt pt --tts xtts --clonar-voz
+  # Com M2M100 (traducao offline)
+  python dublar_pro_v5.py --in video.mp4 --tgt pt --tradutor m2m100
 
   # Multiplos falantes (diarizacao)
   python dublar_pro_v5.py --in video.mp4 --src en --tgt pt --diarize
 
   # Maxima qualidade
   python dublar_pro_v5.py --in video.mp4 --src en --tgt pt --qualidade maximo
-
-  # Usando Parakeet (NVIDIA) - mais rapido que Whisper
-  python dublar_pro_v5.py --in video.mp4 --tgt pt --asr parakeet
-
-  # Parakeet com segmentacao customizada
-  python dublar_pro_v5.py --in video.mp4 --tgt pt --asr parakeet --segment-pause 0.5 --segment-max-words 20
         """
     )
 
@@ -3566,28 +2916,15 @@ Exemplos:
     ap.add_argument("--large-model", action="store_true", help="Usar M2M100 1.2B")
 
     # TTS
-    ap.add_argument("--tts", choices=["edge", "bark", "piper", "xtts", "chatterbox"], default="edge",
-                   help="Engine TTS")
+    ap.add_argument("--tts", choices=["edge", "piper"], default="edge",
+                   help="Engine TTS (edge=online Microsoft, piper=offline)")
     ap.add_argument("--voice", default=None, help="Voz TTS")
     ap.add_argument("--rate", default="+0%", help="Velocidade Edge TTS")
-    ap.add_argument("--texttemp", type=float, default=0.7, help="Bark text temperature")
-    ap.add_argument("--wavetemp", type=float, default=0.5, help="Bark waveform temperature")
-    ap.add_argument("--max-retries", type=int, default=2, help="Max retries TTS")
-    ap.add_argument("--clonar-voz", action="store_true", help="Clonar voz do video original (XTTS)")
 
     # ASR (Transcricao)
-    ap.add_argument("--asr", choices=["whisper", "parakeet"], default="whisper",
-                   help="Engine de transcricao (padrao: whisper)")
     ap.add_argument("--whisper-model", default="large-v3",
                    choices=["tiny", "small", "medium", "large", "large-v2", "large-v3", "large-v3-turbo"],
                    help="Modelo Whisper (padrao: large-v3)")
-    ap.add_argument("--parakeet-model", default="nvidia/parakeet-tdt-1.1b",
-                   choices=["nvidia/parakeet-tdt-1.1b", "nvidia/parakeet-ctc-1.1b", "nvidia/parakeet-rnnt-1.1b"],
-                   help="Modelo Parakeet (padrao: tdt-1.1b)")
-    ap.add_argument("--segment-pause", type=float, default=0.3,
-                   help="Parakeet: pausa minima (segundos) para novo segmento (padrao: 0.3)")
-    ap.add_argument("--segment-max-words", type=int, default=15,
-                   help="Parakeet: maximo de palavras por segmento (padrao: 15)")
 
     # Diarizacao
     ap.add_argument("--diarize", action="store_true", help="Detectar multiplos falantes")
@@ -3625,17 +2962,13 @@ Exemplos:
         args.tradutor = "m2m100"
         args.whisper_model = "medium"  # medium para rapido
     elif args.qualidade == "maximo":
-        args.tts = "xtts" if args.clonar_voz and check_xtts() else "edge"
-        args.tradutor = "ollama" if check_ollama() else "m2m100"
+        args.tts = "edge"
+        args.tradutor = "m2m100"
         args.no_rubberband = False
         args.large_model = True
         args.whisper_model = "large-v3"  # large-v3 para maximo
         args.diarize = True
     # balanceado usa o padrao (large-v3)
-
-    # Se clonar-voz mas nao especificou XTTS
-    if args.clonar_voz and args.tts != "xtts":
-        args.tts = "xtts"
 
     # Configurar seed global
     global GLOBAL_SEED
@@ -3674,7 +3007,7 @@ Exemplos:
     print(f"  Saida: {out_mp4}")
     print(f"  Idiomas: {args.src} -> {args.tgt}")
     print(f"  Tradutor: {args.tradutor}" + (f" ({args.modelo})" if args.tradutor == "ollama" else ""))
-    print(f"  TTS: {args.tts}" + (" (clonagem)" if args.clonar_voz else ""))
+    print(f"  TTS: {args.tts}")
     print(f"  Diarizacao: {'Sim' if args.diarize else 'Nao'}")
     print(f"  Sync: {args.sync} (tol: {args.tolerance}, max: {args.maxstretch})")
     print(f"  Qualidade: {args.qualidade}")
@@ -3695,11 +3028,6 @@ Exemplos:
         "-vn", "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le",
         str(audio_src)])
 
-    # Extrair amostra para clonagem de voz se necessario
-    voice_sample = None
-    if args.clonar_voz:
-        voice_sample = extract_voice_sample(audio_src, workdir)
-
     # Obter duracao do video/audio
     video_duration_s = 0
     try:
@@ -3713,53 +3041,13 @@ Exemplos:
     save_checkpoint(workdir, 2, "extraction", {"video_duration_s": video_duration_s, "video_title": video_title})
     tempos_etapas["1-2_extracao"] = time.time() - t_etapa
 
-    # ========== ETAPA 3: Transcricao ==========
+    # ========== ETAPA 3: Transcricao (Whisper CPU) ==========
     t_etapa = time.time()
-    if args.asr == "parakeet":
-        asr_json, asr_srt, segs, detected_lang = transcribe_parakeet(
-            audio_src, workdir, args.src,
-            model_name=args.parakeet_model,
-            segment_pause=args.segment_pause,
-            segment_max_words=args.segment_max_words,
-            diarize=args.diarize,
-            num_speakers=args.num_speakers,
-            diarize_engine=args.diarize_engine,
-        )
-    elif args.asr == "whisper":
-        # Auto-selecionar: usar OpenAI Whisper (PyTorch GPU) se CTranslate2 nao tem CUDA
-        import torch
-        use_openai_whisper = False
-        if torch.cuda.is_available():
-            try:
-                import ctranslate2
-                ctranslate2.get_supported_compute_types("cuda")
-            except (ValueError, Exception):
-                # CTranslate2 sem CUDA - tentar openai-whisper para usar GPU
-                try:
-                    import whisper
-                    use_openai_whisper = True
-                    print("[INFO] CTranslate2 sem CUDA - usando OpenAI Whisper com PyTorch GPU")
-                except ImportError:
-                    print("[WARN] openai-whisper nao instalado - Whisper rodara em CPU via CTranslate2")
-
-        if use_openai_whisper:
-            asr_json, asr_srt, segs, detected_lang = transcribe_openai_whisper(
-                audio_src, workdir, args.src, args.whisper_model,
-                diarize=args.diarize, num_speakers=args.num_speakers,
-                diarize_engine=args.diarize_engine,
-            )
-        else:
-            asr_json, asr_srt, segs, detected_lang = transcribe_faster_whisper(
-                audio_src, workdir, args.src, args.whisper_model,
-                diarize=args.diarize, num_speakers=args.num_speakers,
-                diarize_engine=args.diarize_engine,
-            )
-    else:
-        asr_json, asr_srt, segs, detected_lang = transcribe_faster_whisper(
-            audio_src, workdir, args.src, args.whisper_model,
-            diarize=args.diarize, num_speakers=args.num_speakers,
-            diarize_engine=args.diarize_engine,
-        )
+    asr_json, asr_srt, segs, detected_lang = transcribe_faster_whisper(
+        audio_src, workdir, args.src, args.whisper_model,
+        diarize=args.diarize, num_speakers=args.num_speakers,
+        diarize_engine=args.diarize_engine,
+    )
     save_checkpoint(workdir, 3, "transcription")
     tempos_etapas["3_transcricao"] = time.time() - t_etapa
 
@@ -3801,40 +3089,13 @@ Exemplos:
 
     # ========== ETAPA 6: TTS ==========
     t_etapa = time.time()
-    if args.tts == "xtts" and voice_sample:
-        result = tts_xtts_clone(segs_trad, workdir, args.tgt, voice_sample)
-        if result[0] is None:
-            print("[INFO] XTTS falhou, usando Edge...")
-            seg_files, sr_segs, tts_metrics = tts_edge(
-                segs_trad, workdir, args.tgt, voice=args.voice, rate=args.rate
-            )
-        else:
-            seg_files, sr_segs, tts_metrics = result
-    elif args.tts == "edge":
-        seg_files, sr_segs, tts_metrics = tts_edge(
-            segs_trad, workdir, args.tgt, voice=args.voice, rate=args.rate
-        )
-    elif args.tts == "bark":
-        voice = args.voice or "v2/pt_speaker_3"
-        seg_files, sr_segs, tts_metrics = tts_bark_optimized(
-            segs_trad, workdir,
-            text_temp=args.texttemp,
-            wave_temp=args.wavetemp,
-            history_prompt=voice,
-            max_retries=args.max_retries
-        )
-    elif args.tts == "chatterbox":
-        seg_files, sr_segs, tts_metrics = tts_chatterbox(
-            segs_trad, workdir, args.tgt, voice_sample
-        )
-        if seg_files is None:
-            print("[INFO] Chatterbox falhou, usando Edge como fallback...")
-            seg_files, sr_segs, tts_metrics = tts_edge(
-                segs_trad, workdir, args.tgt, voice=args.voice, rate=args.rate
-            )
-    else:  # piper
+    if args.tts == "piper":
         seg_files, sr_segs, tts_metrics = tts_piper(
             segs_trad, workdir, args.tgt, model_path=args.voice
+        )
+    else:  # edge (default)
+        seg_files, sr_segs, tts_metrics = tts_edge(
+            segs_trad, workdir, args.tgt, voice=args.voice, rate=args.rate
         )
 
     save_checkpoint(workdir, 6, "tts")
@@ -3957,7 +3218,7 @@ Exemplos:
             "modelo_llm": args.modelo if args.tradutor == "ollama" else None,
             "tts": args.tts,
             "voice": args.voice,
-            "clonar_voz": args.clonar_voz,
+            "clonar_voz": False,
             "diarize": args.diarize,
             "sync": args.sync,
             "tolerance": args.tolerance,

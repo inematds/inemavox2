@@ -7,27 +7,15 @@ services:
     ports:
       - "8010:8010"
     volumes:
-      # Jobs directory (workdirs, checkpoints, output)
       - ./jobs:/app/jobs
-      # Cache de modelos HuggingFace (persistir entre rebuilds)
       - huggingface-cache:/root/.cache/huggingface
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    ipc: host
-    ulimits:
-      memlock: -1
-      stack: 67108864
-    # Network host para acessar Ollama no localhost:11434
-    network_mode: host
     environment:
       - JOBS_DIR=/app/jobs
       - PIPELINE_SCRIPT=/app/dublar_pro_v5.py
       - PYTHON_BIN=python
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     restart: unless-stopped
 
   web:

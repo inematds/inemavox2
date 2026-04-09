@@ -1,20 +1,14 @@
-# Dependencias do Pipeline de Dublagem v4.0 (Dublar Pro)
-# Atualizado: 2025-11-29
+# Dependencias do Pipeline inemavox2 (sem GPU)
+# Atualizado: 2026-04-09
 
 # ============================================
-# CORE ML/AI
+# CORE ML/AI (CPU only)
 # ============================================
-
-# PyTorch - Framework de deep learning
-# CPU: pip install torch
-# GPU CUDA 11.8: pip install torch --index-url https://download.pytorch.org/whl/cu118
-# GPU CUDA 12.1: pip install torch --index-url https://download.pytorch.org/whl/cu121
-torch>=2.0.0
 
 # Transformers - Modelos de traducao (M2M100)
 transformers>=4.30.0
 
-# Faster-Whisper - Transcricao otimizada
+# Faster-Whisper - Transcricao em CPU
 faster-whisper>=1.0.0
 
 # ============================================
@@ -24,21 +18,15 @@ sentencepiece>=0.1.99
 protobuf>=3.20.0
 sacremoses>=0.0.53
 
-# Ollama client (v4 - traducao via LLM)
-httpx>=0.24.0
-
 # ============================================
 # TTS ENGINES
 # ============================================
 
-# Edge TTS - Microsoft (PADRAO v4, recomendado)
+# Edge TTS - Microsoft (padrao, gratis, requer internet)
 edge-tts>=6.1.0
 
-# Bark - TTS multilingue da Suno (offline)
-bark>=0.1.0
-
-# Coqui TTS - Alternativa (Python < 3.12 apenas)
-# TTS>=0.22.0
+# Piper TTS - Offline, leve, CPU
+# pip install piper-tts
 
 # ============================================
 # PROCESSAMENTO DE AUDIO
@@ -49,7 +37,7 @@ librosa>=0.10.0
 soundfile>=0.12.0
 
 # ============================================
-# VIDEO (v4 - download YouTube)
+# VIDEO (download YouTube/social media)
 # ============================================
 yt-dlp>=2023.0.0
 
@@ -65,8 +53,6 @@ Pillow>=10.0.0
 # sudo apt install rubberband-cli  # Opcional, melhor time-stretch
 
 # ============================================
-# OPCIONAIS (instalar separadamente)
+# OPCIONAIS
 # ============================================
-# pip install ollama           # Se quiser usar API Python do Ollama
 # pip install pyannote.audio   # Para diarizacao (detectar falantes)
-# pip install gradio           # Para interface web

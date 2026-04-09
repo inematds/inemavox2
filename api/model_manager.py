@@ -1,9 +1,6 @@
-"""Gerenciador de modelos - Ollama, TTS voices, Whisper models."""
+"""Gerenciador de modelos - TTS voices, Whisper models, opcoes de configuracao."""
 
-import httpx
 import os
-
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 # Vozes Edge TTS organizadas por codigo de idioma curto (pt, en, es, ...)
 EDGE_VOICES = {
@@ -63,39 +60,39 @@ EDGE_VOICES = {
     ],
 }
 
-# Vozes Bark por idioma
-BARK_VOICES = {
-    "pt": [{"id": f"v2/pt_speaker_{i}", "name": f"Speaker {i}"} for i in range(10)],
-    "en": [{"id": f"v2/en_speaker_{i}", "name": f"Speaker {i}"} for i in range(10)],
-    "es": [{"id": f"v2/es_speaker_{i}", "name": f"Speaker {i}"} for i in range(10)],
-    "fr": [{"id": f"v2/fr_speaker_{i}", "name": f"Speaker {i}"} for i in range(10)],
-    "de": [{"id": f"v2/de_speaker_{i}", "name": f"Speaker {i}"} for i in range(10)],
-}
-
 WHISPER_MODELS = [
     {"id": "tiny", "name": "Tiny (39M)", "size_mb": 75, "quality": "baixa"},
     {"id": "small", "name": "Small (244M)", "size_mb": 460, "quality": "media"},
     {"id": "medium", "name": "Medium (769M)", "size_mb": 1500, "quality": "boa"},
-    {"id": "large-v3", "name": "Large v3 (1.5B)", "size_mb": 3000, "quality": "excelente"},
-    {"id": "large-v3-turbo", "name": "Large v3 Turbo (809M)", "size_mb": 1600, "quality": "excelente", "turbo": True},
 ]
 
 ASR_ENGINES = [
     {
-        "id": "whisper",
-        "name": "Whisper (OpenAI / Faster-Whisper)",
-        "description": "Multi-idioma. Suporta 99+ idiomas com deteccao automatica.",
-        "detail": "Usa Faster-Whisper (CTranslate2) com aceleracao GPU ou OpenAI Whisper (PyTorch) como fallback. Detecta idioma automaticamente. Modelos de 39M a 1.5B parametros. O large-v3-turbo e uma versao destilada ~3x mais rapida com qualidade similar ao large-v3.",
+        "id": "groq",
+        "name": "Groq Whisper API",
+        "description": "Whisper large-v3 via API Groq. Muito rapido, barato, requer internet.",
+        "detail": "Usa a API Groq para transcricao com Whisper large-v3-turbo. Qualidade excelente, velocidade muito superior ao local. Requer GROQ_API_KEY.",
         "needs_gpu": False,
+        "needs_internet": True,
         "supports_languages": "all",
     },
     {
-        "id": "parakeet",
-        "name": "Parakeet (NVIDIA NeMo)",
-        "description": "Otimizado para GPU NVIDIA. Apenas ingles, ~3-5x mais rapido que Whisper.",
-        "detail": "Modelo da NVIDIA treinado para ingles. Usa NeMo toolkit com otimizacoes para GPUs NVIDIA. Significativamente mais rapido que Whisper para ingles. NAO suporta outros idiomas. Requer GPU NVIDIA com CUDA. Modelos: TDT-1.1B (recomendado, melhor pontuacao), CTC-1.1B (mais rapido), RNNT-1.1B (mais preciso).",
-        "needs_gpu": True,
-        "supports_languages": ["en"],
+        "id": "whisper-cpu",
+        "name": "Whisper CPU (Faster-Whisper)",
+        "description": "Multi-idioma. Roda localmente em CPU, sem internet. Modelos tiny/small/medium.",
+        "detail": "Usa Faster-Whisper (CTranslate2) em CPU. Modelos de 39M a 769M parametros. Mais lento que API mas funciona offline.",
+        "needs_gpu": False,
+        "needs_internet": False,
+        "supports_languages": "all",
+    },
+    {
+        "id": "openai",
+        "name": "OpenAI Whisper API",
+        "description": "Whisper via API OpenAI. Confiavel, $0.006/min.",
+        "detail": "Usa a API oficial OpenAI para transcricao com Whisper. Requer OPENAI_API_KEY.",
+        "needs_gpu": False,
+        "needs_internet": True,
+        "supports_languages": "all",
     },
 ]
 
@@ -110,15 +107,6 @@ TTS_ENGINES = [
         "detail": "Usa a API gratuita da Microsoft (mesmas vozes do Windows e Edge). Suporta dezenas de idiomas com multiplas vozes por idioma. Qualidade excelente, velocidade rapida, sem custo de GPU. Unica desvantagem: precisa de conexao com internet.",
     },
     {
-        "id": "bark",
-        "name": "Bark (Suno AI)",
-        "needs_gpu": True,
-        "needs_internet": False,
-        "quality": "boa",
-        "description": "Voz expressiva com emocao. Ri, suspira, tem entonacao natural. Lento.",
-        "detail": "Modelo generativo da Suno AI que produz fala com emocao real: risadas, pausas dramaticas, suspiros, entonacao expressiva. Consome bastante VRAM e e significativamente mais lento que Edge TTS. Ideal para conteudo dramatico ou quando expressividade importa mais que velocidade.",
-    },
-    {
         "id": "piper",
         "name": "Piper (Leve)",
         "needs_gpu": False,
@@ -126,24 +114,6 @@ TTS_ENGINES = [
         "quality": "razoavel",
         "description": "Ultra-leve e offline. Roda em qualquer hardware sem internet.",
         "detail": "Motor TTS minimalista que roda em CPU sem internet. Muito rapido e leve, ideal para ambientes sem rede ou com hardware limitado. Qualidade inferior aos outros motores - voz soa mais robotica. Use quando offline total for requisito.",
-    },
-    {
-        "id": "xtts",
-        "name": "XTTS (Clonar Voz)",
-        "needs_gpu": True,
-        "needs_internet": False,
-        "quality": "muito boa",
-        "description": "Clona a voz original do video. A dublagem soa como a mesma pessoa.",
-        "detail": "Modelo Coqui XTTS que clona a voz do falante original do video. Extrai caracteristicas da voz (timbre, tom, ritmo) e gera a fala traduzida com a mesma voz. Requer GPU e e mais lento. O resultado e impressionante: parece que a pessoa original esta falando em outro idioma.",
-    },
-    {
-        "id": "chatterbox",
-        "name": "Chatterbox (Voice Clone Neural)",
-        "needs_gpu": True,
-        "needs_internet": False,
-        "quality": "excelente",
-        "description": "Voice clone zero-shot de alta qualidade. Suporta PT, EN e 20+ idiomas.",
-        "detail": "Modelo neural da Resemble AI. Roteamento automatico: ingles usa Turbo 350M (rapido), outros idiomas usam Multilingual 500M (PT, ES, FR, DE e mais 20 idiomas). Voice clone zero-shot: com --clonar-voz extrai a voz do video e gera o audio dublado com o mesmo timbre. SR de saida: 24000 Hz. Requer conda env 'chatterbox' instalado.",
     },
 ]
 
@@ -157,12 +127,12 @@ TRANSLATION_ENGINES = [
         "detail": "Modelo multilingual da Meta. Suporta 100 idiomas em qualquer direcao sem passar pelo ingles. Modelo 418M rapido e leve, 1.2B melhor qualidade. Roda em CPU. Bom para frases curtas, pode perder contexto em frases longas.",
     },
     {
-        "id": "ollama",
-        "name": "Ollama (LLM Local)",
-        "needs_gpu": True,
+        "id": "llm-cloud",
+        "name": "LLM Cloud (Groq/OpenAI/Claude)",
+        "needs_gpu": False,
         "models": "dynamic",
-        "description": "Traducao via LLM local. Melhor qualidade, mais lento, requer VRAM.",
-        "detail": "Usa LLM local via Ollama. Qualidade superior ao M2M100 pois entende contexto, expressoes idiomaticas e tom. Requer Ollama instalado com modelo carregado (ex: qwen2.5:14b). Mais lento e usa VRAM da GPU. Ideal quando qualidade de traducao e prioridade.",
+        "description": "Traducao via LLM na nuvem. Melhor qualidade contextual, requer API key.",
+        "detail": "Usa LLM via API cloud (Groq, OpenAI, Anthropic, etc). Qualidade superior ao M2M100 pois entende contexto, expressoes idiomaticas e tom. Requer API key configurada.",
     },
 ]
 
@@ -186,7 +156,7 @@ CONTENT_TYPES = [
         "name": "Curso / Aula",
         "description": "Conteudo educacional. Nunca corta frases, comprime bastante se preciso.",
         "detail": "Mantem todas as frases completas sem cortar nenhuma palavra. Se a traducao ficar mais longa que o original, comprime a velocidade da fala em ate 2x. Ideal para cursos e aulas onde perder conteudo e inaceitavel, mesmo que a fala fique um pouco mais rapida.",
-        "presets": {"sync": "smart", "maxstretch": 2.0, "no_truncate": True},
+        "presets": {"sync": "fit", "maxstretch": 1.4, "no_truncate": True},
     },
     {
         "id": "podcast",
@@ -241,141 +211,6 @@ SUPPORTED_LANGUAGES = [
 ]
 
 
-async def get_ollama_models() -> list:
-    """Lista modelos disponiveis no Ollama."""
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{OLLAMA_HOST}/api/tags")
-            if resp.status_code == 200:
-                data = resp.json()
-                return [
-                    {
-                        "id": m["name"],
-                        "name": m["name"],
-                        "size_gb": round(m.get("size", 0) / 1e9, 1),
-                        "modified": m.get("modified_at", ""),
-                    }
-                    for m in data.get("models", [])
-                ]
-    except Exception:
-        pass
-    return []
-
-
-async def get_ollama_status() -> dict:
-    """Verifica status do Ollama."""
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{OLLAMA_HOST}/api/tags")
-            running_resp = await client.get(f"{OLLAMA_HOST}/api/ps")
-            running = []
-            if running_resp.status_code == 200:
-                running = running_resp.json().get("models", [])
-            return {
-                "online": resp.status_code == 200,
-                "host": OLLAMA_HOST,
-                "running_models": [m.get("name", "") for m in running],
-            }
-    except Exception:
-        return {"online": False, "host": OLLAMA_HOST, "running_models": []}
-
-
-async def start_ollama() -> dict:
-    """Inicia o servico Ollama."""
-    import subprocess, shutil
-    ollama_bin = shutil.which("ollama")
-    if not ollama_bin:
-        return {"success": False, "error": "Ollama nao encontrado. Instale: curl -fsSL https://ollama.com/install.sh | sh"}
-    # Verificar se ja esta rodando
-    try:
-        async with httpx.AsyncClient(timeout=2) as client:
-            resp = await client.get(f"{OLLAMA_HOST}/api/tags")
-            if resp.status_code == 200:
-                return {"success": True, "message": "Ollama ja estava rodando"}
-    except Exception:
-        pass
-    # Iniciar em background
-    try:
-        subprocess.Popen(
-            [ollama_bin, "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        # Aguardar ate 5s para ficar pronto
-        import asyncio
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            try:
-                async with httpx.AsyncClient(timeout=2) as client:
-                    resp = await client.get(f"{OLLAMA_HOST}/api/tags")
-                    if resp.status_code == 200:
-                        return {"success": True, "message": "Ollama iniciado"}
-            except Exception:
-                continue
-        return {"success": False, "error": "Ollama iniciou mas nao respondeu a tempo"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-async def stop_ollama() -> dict:
-    """Para o servico Ollama."""
-    import subprocess, signal
-    try:
-        # Encontrar PID do ollama serve
-        result = subprocess.run(["pgrep", "-f", "ollama serve"], capture_output=True, text=True)
-        pids = result.stdout.strip().split()
-        if not pids:
-            return {"success": True, "message": "Ollama nao estava rodando"}
-        for pid in pids:
-            os.kill(int(pid), signal.SIGTERM)
-        # Aguardar parar
-        import asyncio
-        for _ in range(6):
-            await asyncio.sleep(0.5)
-            try:
-                async with httpx.AsyncClient(timeout=1) as client:
-                    await client.get(f"{OLLAMA_HOST}/api/tags")
-            except Exception:
-                return {"success": True, "message": "Ollama parado"}
-        return {"success": True, "message": "Sinal enviado, pode demorar a parar"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-async def pull_ollama_model(model: str):
-    """Baixa um modelo no Ollama (streaming progress)."""
-    try:
-        async with httpx.AsyncClient(timeout=600) as client:
-            async with client.stream(
-                "POST",
-                f"{OLLAMA_HOST}/api/pull",
-                json={"name": model, "stream": True},
-            ) as resp:
-                last_status = ""
-                async for line in resp.aiter_lines():
-                    if line.strip():
-                        import json
-                        data = json.loads(line)
-                        last_status = data.get("status", "")
-                return {"success": True, "status": last_status}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-async def unload_ollama_model(model: str) -> bool:
-    """Descarrega modelo Ollama para liberar VRAM."""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{OLLAMA_HOST}/api/generate",
-                json={"model": model, "keep_alive": 0},
-            )
-            return resp.status_code == 200
-    except Exception:
-        return False
-
-
 def get_all_options() -> dict:
     """Retorna todas as opcoes disponiveis para a interface."""
     return {
@@ -384,7 +219,6 @@ def get_all_options() -> dict:
         "whisper_models": WHISPER_MODELS,
         "asr_engines": ASR_ENGINES,
         "edge_voices": EDGE_VOICES,
-        "bark_voices": BARK_VOICES,
         "content_types": CONTENT_TYPES,
         "languages": SUPPORTED_LANGUAGES,
     }

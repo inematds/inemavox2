@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from api.job_manager import JobManager
-from api.model_manager import get_ollama_models, get_ollama_status, unload_ollama_model, start_ollama, stop_ollama, pull_ollama_model, get_all_options
+from api.model_manager import get_all_options
 from api.system_monitor import get_system_status
 from api.stats_tracker import get_stats_summary
 
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.11.1"
 
 app = FastAPI(
     title="inemaVOX API",
@@ -52,9 +52,8 @@ app.add_middleware(
 
 @app.get("/api/system/status")
 async def system_status():
-    """Status completo do sistema (GPU, CPU, RAM, disco)."""
+    """Status completo do sistema (CPU, RAM, disco)."""
     status = get_system_status()
-    status["ollama"] = await get_ollama_status()
     status["version"] = APP_VERSION
     return status
 
@@ -64,53 +63,7 @@ async def system_status():
 @app.get("/api/models/options")
 async def get_options():
     """Todas as opcoes disponiveis (TTS, ASR, traducao, idiomas, etc)."""
-    options = get_all_options()
-    options["ollama_models"] = await get_ollama_models()
-    return options
-
-
-@app.get("/api/models/ollama")
-async def list_ollama_models():
-    """Lista modelos Ollama disponiveis."""
-    return await get_ollama_models()
-
-
-@app.post("/api/models/ollama/unload")
-async def unload_model(model: str):
-    """Descarrega modelo Ollama para liberar VRAM."""
-    success = await unload_ollama_model(model)
-    return {"success": success, "model": model}
-
-
-@app.post("/api/ollama/start")
-async def api_start_ollama():
-    """Inicia o servico Ollama."""
-    return await start_ollama()
-
-
-@app.post("/api/ollama/stop")
-async def api_stop_ollama():
-    """Para o servico Ollama."""
-    return await stop_ollama()
-
-
-@app.get("/api/ollama/status")
-async def api_ollama_status():
-    """Status do Ollama (online, modelos)."""
-    status = await get_ollama_status()
-    if status["online"]:
-        status["models"] = await get_ollama_models()
-    return status
-
-
-@app.post("/api/ollama/pull")
-async def api_pull_model(body: dict):
-    """Baixa um modelo no Ollama."""
-    model = body.get("model", "")
-    if not model:
-        raise HTTPException(400, "Campo 'model' obrigatorio")
-    result = await pull_ollama_model(model)
-    return result
+    return get_all_options()
 
 
 # --- Jobs: Specific routes BEFORE {job_id} to avoid conflicts ---
@@ -164,102 +117,6 @@ async def create_tts_job(config: dict):
     return job.to_dict()
 
 
-@app.post("/api/jobs/tts/upload")
-async def create_tts_job_with_ref(
-    file: UploadFile = File(...),
-    config_json: str = Form(...),
-):
-    """Criar job TTS Chatterbox com audio de referencia para voice clone."""
-    config = json.loads(config_json)
-    if "text" not in config:
-        raise HTTPException(400, "Campo obrigatorio: text")
-    suffix = Path(file.filename).suffix or ".wav"
-    safe_name = f"{uuid.uuid4().hex[:8]}_ref{suffix}"
-    upload_path = UPLOAD_DIR / safe_name
-    with open(upload_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
-    config["ref_audio"] = str(upload_path.absolute())
-    config["engine"] = "chatterbox"
-    config["job_type"] = "tts_generate"
-    if "lang" not in config:
-        config["lang"] = "pt"
-    job = await job_manager.create_job(config)
-    return job.to_dict()
-
-
-@app.post("/api/jobs/voice-clone")
-async def create_voice_clone_job(
-    file: UploadFile = File(...),
-    config_json: str = Form(...),
-):
-    """Criar job de voice clone com upload de audio de referencia."""
-    config = json.loads(config_json)
-    if "text" not in config:
-        raise HTTPException(400, "Campo obrigatorio: text")
-    suffix = Path(file.filename).suffix or ".wav"
-    safe_name = f"{uuid.uuid4().hex[:8]}_ref{suffix}"
-    upload_path = UPLOAD_DIR / safe_name
-    with open(upload_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
-    config["ref_audio"] = str(upload_path.absolute())
-    config["engine"] = "chatterbox"
-    config["job_type"] = "voice_clone"
-    if "lang" not in config:
-        config["lang"] = "pt"
-    job = await job_manager.create_job(config)
-    return job.to_dict()
-
-
-@app.post("/api/jobs/voice-clone/url")
-async def create_voice_clone_job_url(config: dict):
-    """Criar job de voice clone baixando audio de referencia a partir de uma URL."""
-    import asyncio
-
-    ref_url = config.pop("ref_url", None)
-    if not ref_url:
-        raise HTTPException(400, "Campo obrigatorio: ref_url")
-    if "text" not in config:
-        raise HTTPException(400, "Campo obrigatorio: text")
-
-    ref_id = uuid.uuid4().hex[:8]
-    out_path = UPLOAD_DIR / f"{ref_id}_ref.mp3"
-
-    try:
-        import yt_dlp  # type: ignore
-    except ImportError:
-        raise HTTPException(500, "yt-dlp nao instalado")
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": str(UPLOAD_DIR / f"{ref_id}_ref.%(ext)s"),
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    def do_download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([ref_url])
-
-    try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, do_download)
-    except Exception as e:
-        raise HTTPException(500, f"Erro ao baixar referencia: {e}")
-
-    downloaded = list(UPLOAD_DIR.glob(f"{ref_id}_ref.*"))
-    if not downloaded:
-        raise HTTPException(500, "Falha ao baixar referencia — arquivo nao encontrado apos download")
-
-    config["ref_audio"] = str(downloaded[0].absolute())
-    config["engine"] = "chatterbox"
-    config["job_type"] = "voice_clone"
-    if "lang" not in config:
-        config["lang"] = "pt"
-    job = await job_manager.create_job(config)
-    return job.to_dict()
 
 
 @app.get("/api/jobs/{job_id}/audio")
@@ -739,8 +596,8 @@ async def retry_job(job_id: str):
     job = job_manager.get_job(job_id)
     if not job:
         raise HTTPException(404, "Job nao encontrado")
-    if job.status not in ("failed", "cancelled"):
-        raise HTTPException(400, f"Somente jobs failed/cancelled podem ser re-tentados (status atual: {job.status})")
+    if job.status not in ("failed", "cancelled", "completed"):
+        raise HTTPException(400, f"Somente jobs finalizados podem ser re-tentados (status atual: {job.status})")
     new_job = await job_manager.create_job(dict(job.config))
     return {"id": new_job.id, "status": new_job.status}
 

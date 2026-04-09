@@ -62,18 +62,50 @@ PROVIDER_BASE_URLS = {
 }
 
 
-def write_checkpoint(workdir: Path, step_num: int, step_id: str, step_name: str):
-    """Escreve checkpoint no mesmo formato do dublar_pro_v5.py."""
+def write_checkpoint(workdir: Path, step_num: int, step_id: str, step_name: str, data: dict | None = None):
+    """Escreve checkpoint no mesmo formato do dublar_pro_v5.py, preservando dados anteriores."""
+    cp_path = workdir / "dub_work" / "checkpoint.json"
+    existing_data: dict = {}
+    if cp_path.exists():
+        try:
+            existing_data = json.loads(cp_path.read_text()).get("data", {}) or {}
+        except Exception:
+            pass
     cp = {
         "last_step_num": step_num,
         "last_step": step_id,
         "last_step_name": step_name,
         "timestamp": time.time(),
+        "data": {**existing_data, **(data or {})},
     }
-    cp_path = workdir / "dub_work" / "checkpoint.json"
     cp_path.parent.mkdir(parents=True, exist_ok=True)
     cp_path.write_text(json.dumps(cp, indent=2))
     print(f"[checkpoint] etapa {step_num}: {step_name}", flush=True)
+
+
+def _get_video_meta(workdir: Path, source: Path, input_val: str) -> tuple[str, float]:
+    """Retorna (titulo, duracao_s) do video."""
+    title = ""
+    info_json = workdir / "dub_work" / "source.info.json"
+    if info_json.exists():
+        try:
+            info = json.loads(info_json.read_text(encoding="utf-8"))
+            title = str(info.get("title", "") or "")
+        except Exception:
+            pass
+    if not title and not input_val.startswith("http"):
+        title = source.stem
+    dur_s = 0.0
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(source)],
+            capture_output=True, text=True, timeout=10,
+        )
+        dur_s = round(float(probe.stdout.strip()), 1)
+    except Exception:
+        pass
+    return title, dur_s
 
 
 def download_input(input_val: str, workdir: Path) -> Path:
@@ -88,6 +120,7 @@ def download_input(input_val: str, workdir: Path) -> Path:
             "--merge-output-format", "mp4",
             "--output", str(out_template),
             "--no-playlist",
+            "--write-info-json",
             input_val,
         ]
         result = subprocess.run(cmd, capture_output=False)
@@ -241,28 +274,12 @@ def extract_audio(source: Path, workdir: Path) -> Path:
     return audio_path
 
 
-def _has_cuda() -> bool:
-    """Verifica se CUDA esta disponivel no PyTorch E no CTranslate2 (mesmo check do dublar_pro_v5.py)."""
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return False
-        import ctranslate2
-        ctranslate2.get_supported_compute_types("cuda")  # lanca ValueError se sem CUDA
-        return True
-    except Exception:
-        return False
-
-
-def transcribe_for_viral(audio_path: Path, model: str = "large-v3") -> list[dict]:
-    """Transcreve com faster-whisper para analise viral."""
-    print(f"[transcription] Transcrevendo com Whisper (modelo: {model})...", flush=True)
+def transcribe_for_viral(audio_path: Path, model: str = "small") -> list[dict]:
+    """Transcreve com faster-whisper em CPU para analise viral."""
+    print(f"[transcription] Transcrevendo com Whisper CPU (modelo: {model})...", flush=True)
     from faster_whisper import WhisperModel
 
-    device = "cuda" if _has_cuda() else "cpu"
-    compute = "float16" if device == "cuda" else "int8"
-
-    wm = WhisperModel(model, device=device, compute_type=compute)
+    wm = WhisperModel(model, device="cpu", compute_type="int8")
     segments_iter, info = wm.transcribe(str(audio_path), vad_filter=True)
 
     results = []
@@ -275,49 +292,6 @@ def transcribe_for_viral(audio_path: Path, model: str = "large-v3") -> list[dict
 
     print(f"[transcription] {len(results)} segmentos, idioma: {info.language}", flush=True)
     return results
-
-
-def transcribe_parakeet(audio_path: Path, model: str = "nvidia/parakeet-tdt-1.1b",
-                        segment_pause: float = 0.3, segment_max_words: int = 15) -> list[dict]:
-    """Transcreve com NVIDIA Parakeet (NeMo) — apenas ingles, mais rapido que Whisper."""
-    print(f"[transcription] Transcrevendo com Parakeet (modelo: {model})...", flush=True)
-    try:
-        import nemo.collections.asr as nemo_asr
-    except ImportError:
-        print("[WARN] NeMo nao instalado. Usando Whisper large-v3 como fallback...", flush=True)
-        return transcribe_for_viral(audio_path, "large-v3")
-
-    import torch
-    mdl = nemo_asr.models.ASRModel.from_pretrained(model)
-    if torch.cuda.is_available():
-        mdl = mdl.cuda()
-
-    output = mdl.transcribe([str(audio_path)], timestamps=True)
-    hyp = output[0][0] if isinstance(output[0], list) else output[0]
-
-    segs = []
-    if hasattr(hyp, "timestamp") and hyp.timestamp and "word" in hyp.timestamp:
-        words = hyp.timestamp["word"]
-        cur = {"start": 0, "end": 0, "words": []}
-        for w in words:
-            s, e, word = w.get("start", 0), w.get("end", 0), w.get("word", "")
-            if not cur["words"]:
-                cur = {"start": s, "end": e, "words": [word]}
-            elif (s - cur["end"] > segment_pause or len(cur["words"]) >= segment_max_words):
-                segs.append({"start": cur["start"], "end": cur["end"], "text": " ".join(cur["words"])})
-                cur = {"start": s, "end": e, "words": [word]}
-            else:
-                cur["end"] = e
-                cur["words"].append(word)
-        if cur["words"]:
-            segs.append({"start": cur["start"], "end": cur["end"], "text": " ".join(cur["words"])})
-    else:
-        text = hyp.text if hasattr(hyp, "text") else str(hyp)
-        segs.append({"start": 0, "end": 0, "text": text})
-        print("[WARN] Parakeet nao retornou timestamps por palavra", flush=True)
-
-    print(f"[transcription] {len(segs)} segmentos (Parakeet/en)", flush=True)
-    return segs
 
 
 def _compact_segments(segments: list[dict], target_chunk_secs: float = 30.0) -> list[dict]:
@@ -407,42 +381,6 @@ def _parse_llm_response(content: str, provider: str) -> list[dict]:
 def _estimate_tokens(text: str) -> int:
     """Estimativa rapida de tokens (1 token ≈ 4 chars)."""
     return len(text) // 4
-
-
-def _call_ollama(system: str, user: str, model: str, ollama_url: str) -> str:
-    """Chama Ollama com streaming. timeout=None = sem limite (modelo pode demorar horas)."""
-    # Ajusta num_ctx dinamicamente: min 8k, max 128k, baseado no tamanho real do prompt
-    prompt_tokens = _estimate_tokens(system + user)
-    # Arredonda para cima para o próximo múltiplo de 8192, com margem para a resposta
-    num_ctx = max(8192, min(131072, ((prompt_tokens + 4096) // 8192 + 1) * 8192))
-    print(f"[llm] prompt ~{prompt_tokens} tokens → num_ctx={num_ctx}", flush=True)
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "stream": True,
-        "options": {"temperature": 0.3, "num_ctx": num_ctx},
-    }
-    req = urllib.request.Request(
-        f"{ollama_url}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    parts = []
-    with urllib.request.urlopen(req, timeout=None) as resp:
-        for raw_line in resp:
-            line = raw_line.decode("utf-8").strip()
-            if not line:
-                continue
-            chunk = json.loads(line)
-            parts.append(chunk.get("message", {}).get("content", ""))
-            if chunk.get("done"):
-                break
-    return "".join(parts)
 
 
 def _call_openai_compat(system: str, user: str, model: str, api_key: str, base_url: str) -> str:
@@ -547,9 +485,7 @@ def analyze_viral(
     num_clips: int,
     min_dur: int | None = None,
     max_dur: int | None = None,
-    provider: str = "ollama",
-    ollama_model: str = "qwen2.5:7b",
-    ollama_url: str = "http://localhost:11434",
+    provider: str = "groq",
     llm_model: str = "",
     llm_api_key: str = "",
     llm_base_url: str = "",
@@ -558,20 +494,17 @@ def analyze_viral(
     topics_mode: bool = False,
 ) -> list[dict]:
     """Identifica segmentos virais ou por assunto usando o provider LLM configurado."""
-    model_label = llm_model if provider != "ollama" else ollama_model
     if topics_mode:
-        print(f"[analysis] Analisando assuntos com {provider}/{model_label} ({num_clips} max topicos)...", flush=True)
+        print(f"[analysis] Analisando assuntos com {provider}/{llm_model} ({num_clips} max topicos)...", flush=True)
     else:
-        print(f"[analysis] Analisando com {provider}/{model_label} ({num_clips} clips, {min_dur}-{max_dur}s)...", flush=True)
+        print(f"[analysis] Analisando com {provider}/{llm_model} ({num_clips} clips, {min_dur}-{max_dur}s)...", flush=True)
 
     system, user = _build_prompts(segments, num_clips, min_dur, max_dur, system_prompt, user_prompt, topics_mode=topics_mode)
 
     try:
-        if provider == "ollama":
-            content = _call_ollama(system, user, ollama_model, ollama_url)
-        elif provider == "anthropic":
+        if provider == "anthropic":
             content = _call_anthropic(system, user, llm_model, llm_api_key)
-        else:  # openai, groq, deepseek, together, custom
+        else:  # openai, groq, deepseek, together, openrouter, custom
             base = llm_base_url or PROVIDER_BASE_URLS.get(provider, "")
             if not base:
                 raise ValueError(f"Base URL nao definida para provider '{provider}'")
@@ -589,25 +522,25 @@ def main():
     parser.add_argument("--outdir", required=True, help="Diretorio de saida para clips")
     parser.add_argument("--mode", default="manual", choices=["manual", "viral", "topics"])
     parser.add_argument("--timestamps", default="", help="Ex: 00:30-02:15,05:00-07:30")
-    parser.add_argument("--ollama-model", default="qwen2.5:7b", dest="ollama_model")
     parser.add_argument("--num-clips", type=int, default=5, dest="num_clips")
     parser.add_argument("--min-duration", type=int, default=30, dest="min_duration")
     parser.add_argument("--max-duration", type=int, default=120, dest="max_duration")
-    parser.add_argument("--asr-engine", default="whisper", choices=["whisper", "parakeet"], dest="asr_engine")
-    parser.add_argument("--whisper-model", default="large-v3", dest="whisper_model")
-    parser.add_argument("--parakeet-model", default="nvidia/parakeet-tdt-1.1b", dest="parakeet_model",
-                        choices=["nvidia/parakeet-tdt-1.1b", "nvidia/parakeet-ctc-1.1b", "nvidia/parakeet-rnnt-1.1b"])
-    parser.add_argument("--ollama-url", default="http://localhost:11434", dest="ollama_url")
-    # Providers externos
-    parser.add_argument("--llm-provider", default="ollama",
-                        choices=["ollama", "openai", "anthropic", "groq", "deepseek", "together", "openrouter", "custom"],
+    parser.add_argument("--whisper-model", default="small", dest="whisper_model")
+    # LLM providers
+    parser.add_argument("--llm-provider", default="groq",
+                        choices=["openai", "anthropic", "groq", "deepseek", "together", "openrouter", "custom"],
                         dest="llm_provider")
     parser.add_argument("--llm-model", default="", dest="llm_model",
-                        help="Modelo para providers externos (ex: gpt-4o, claude-opus-4-5)")
+                        help="Modelo LLM (ex: llama-3.3-70b-versatile, gpt-4o, claude-opus-4-5)")
     parser.add_argument("--llm-api-key", default="", dest="llm_api_key",
-                        help="API key para providers externos")
+                        help="API key para o provider LLM")
     parser.add_argument("--llm-base-url", default="", dest="llm_base_url",
                         help="Base URL para provider custom (compativel com OpenAI)")
+    # Legado (ignorado, mantido para compatibilidade)
+    parser.add_argument("--ollama-model", default="", dest="ollama_model", help=argparse.SUPPRESS)
+    parser.add_argument("--ollama-url", default="", dest="ollama_url", help=argparse.SUPPRESS)
+    parser.add_argument("--asr-engine", default="whisper", dest="asr_engine", help=argparse.SUPPRESS)
+    parser.add_argument("--parakeet-model", default="", dest="parakeet_model", help=argparse.SUPPRESS)
     parser.add_argument("--split-equal", action="store_true", dest="split_equal",
                         help="Dividir em partes iguais sem usar IA (ignora LLM e transcricao)")
     parser.add_argument("--system-prompt", default="", dest="system_prompt",
@@ -629,7 +562,9 @@ def main():
         if args.mode == "manual":
             # Etapa 1: Download
             source = download_input(args.input, workdir)
-            write_checkpoint(workdir, 1, "download", "Download")
+            _vid_title, _vid_dur = _get_video_meta(workdir, source, args.input)
+            write_checkpoint(workdir, 1, "download", "Download",
+                             data={"video_title": _vid_title, "video_duration_s": _vid_dur})
 
             # Etapa 2: Cutting
             timestamps = parse_timestamps(args.timestamps)
@@ -649,7 +584,9 @@ def main():
         else:  # viral / topics
             # Etapa 1: Download
             source = download_input(args.input, workdir)
-            write_checkpoint(workdir, 1, "download", "Download")
+            _vid_title, _vid_dur = _get_video_meta(workdir, source, args.input)
+            write_checkpoint(workdir, 1, "download", "Download",
+                             data={"video_title": _vid_title, "video_duration_s": _vid_dur})
 
             if args.split_equal:
                 # Modo: dividir em partes iguais (sem IA)
@@ -673,26 +610,41 @@ def main():
                 write_checkpoint(workdir, 2, "extraction", "Extracao de audio")
 
                 # Etapa 3: Transcription
-                if args.asr_engine == "parakeet":
-                    segments = transcribe_parakeet(audio, args.parakeet_model)
-                else:
-                    segments = transcribe_for_viral(audio, args.whisper_model)
+                segments = transcribe_for_viral(audio, args.whisper_model)
                 if not segments:
                     raise RuntimeError("Nenhum segmento de fala detectado no audio")
                 write_checkpoint(workdir, 3, "transcription", "Transcricao")
 
                 # Etapa 4: Analysis
                 is_topics = (args.mode == "topics")
+                # Resolver API key: argumento > env var
+                api_key = args.llm_api_key
+                if not api_key:
+                    provider_upper = args.llm_provider.upper()
+                    api_key = os.environ.get(f"{provider_upper}_API_KEY", "")
+                if not api_key:
+                    api_key = os.environ.get("GROQ_API_KEY", "")
+
+                # Resolver modelo default por provider
+                llm_model = args.llm_model
+                if not llm_model:
+                    default_models = {
+                        "groq": "llama-3.3-70b-versatile",
+                        "openai": "gpt-4o",
+                        "anthropic": "claude-sonnet-4-20250514",
+                        "deepseek": "deepseek-chat",
+                        "together": "meta-llama/Llama-3-70b-chat-hf",
+                    }
+                    llm_model = default_models.get(args.llm_provider, "")
+
                 viral_clips = analyze_viral(
                     segments,
                     args.num_clips,
                     min_dur=None if is_topics else args.min_duration,
                     max_dur=None if is_topics else args.max_duration,
                     provider=args.llm_provider,
-                    ollama_model=args.ollama_model,
-                    ollama_url=args.ollama_url,
-                    llm_model=args.llm_model,
-                    llm_api_key=args.llm_api_key,
+                    llm_model=llm_model,
+                    llm_api_key=api_key,
                     llm_base_url=args.llm_base_url,
                     system_prompt=args.system_prompt or None,
                     user_prompt=args.user_prompt or None,
